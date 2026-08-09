@@ -30,8 +30,9 @@ BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
 
 def _extract(url: str) -> dict:
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "no_warnings": False,
+        "verbose": True,  # DEBUG: temporary — check Render Logs tab after hitting /info
         "skip_download": True,
         "noplaylist": True,
         # "web" ab primary hai kyunki PO token (bgutil provider se) mil raha
