@@ -40,9 +40,9 @@ def _extract(url: str) -> dict:
         # (agar provider down ho to bhi kam-se-kam 360p muxed to milega).
         "extractor_args": {
             "youtube": {
-                "player_client": ["web", "tv_embedded", "ios", "android"],
+                "player_client": ["web", "ios", "android"],
             },
-            **({"youtubepot-bgutilhttp": {"base_url": BGUTIL_PROVIDER_URL}} if BGUTIL_PROVIDER_URL else {}),
+            **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
         # agar cookies.txt use karni ho (login-required/age-restricted videos ke liye):
         # "cookiefile": "cookies.txt",
@@ -134,8 +134,8 @@ def debug(url: str = Query(..., description="YouTube video URL")):
         "noplaylist": True,
         "logger": logger,
         "extractor_args": {
-            "youtube": {"player_client": ["web", "tv_embedded", "ios", "android"]},
-            **({"youtubepot-bgutilhttp": {"base_url": BGUTIL_PROVIDER_URL}} if BGUTIL_PROVIDER_URL else {}),
+            "youtube": {"player_client": ["web", "ios", "android"]},
+            **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
     }
     extracted_ok = False
