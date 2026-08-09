@@ -16,9 +16,16 @@ Render pe deploy:
 """
 
 from fastapi import FastAPI, HTTPException, Query
+import os
 import yt_dlp
 
 app = FastAPI(title="ytinfo-api")
+
+# bgutil-ytdlp-pot-provider ka HTTP server URL — Render dashboard me
+# "Environment" tab se BGUTIL_PROVIDER_URL naam ka env var set karo
+# (e.g. https://bgutil-pot-provider-xxxx.onrender.com). Isse PO token
+# milta hai jo "web" client ko full quality formats dene deta hai.
+BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
 
 
 def _extract(url: str) -> dict:
@@ -27,14 +34,15 @@ def _extract(url: str) -> dict:
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
-        # YouTube ke default "web" client ko ab kai formats ke liye PO token
-        # chahiye hota hai, jiske bina "Requested format is not available"
-        # error aata hai. "android" client ko PO token nahi chahiye, isliye
-        # usse pehle try karo, na chale to "web" pe fallback.
+        # "web" ab primary hai kyunki PO token (bgutil provider se) mil raha
+        # hai — isi client se full adaptive format list (144p-4320p video +
+        # sab audio bitrates) milti hai. Baaki clients sirf fallback hain
+        # (agar provider down ho to bhi kam-se-kam 360p muxed to milega).
         "extractor_args": {
             "youtube": {
-                "player_client": ["tv_embedded", "tv", "ios", "android", "web"],
-            }
+                "player_client": ["web", "tv_embedded", "ios", "android"],
+            },
+            **({"youtubepot-bgutilhttp": {"base_url": BGUTIL_PROVIDER_URL}} if BGUTIL_PROVIDER_URL else {}),
         },
         # agar cookies.txt use karni ho (login-required/age-restricted videos ke liye):
         # "cookiefile": "cookies.txt",
