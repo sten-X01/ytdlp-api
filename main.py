@@ -27,6 +27,15 @@ def _extract(url: str) -> dict:
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        # YouTube ke default "web" client ko ab kai formats ke liye PO token
+        # chahiye hota hai, jiske bina "Requested format is not available"
+        # error aata hai. "android" client ko PO token nahi chahiye, isliye
+        # usse pehle try karo, na chale to "web" pe fallback.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
+        },
         # agar cookies.txt use karni ho (login-required/age-restricted videos ke liye):
         # "cookiefile": "cookies.txt",
     }
