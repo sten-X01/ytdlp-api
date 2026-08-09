@@ -33,7 +33,7 @@ def _extract(url: str) -> dict:
         # usse pehle try karo, na chale to "web" pe fallback.
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "android", "web"],
+                "player_client": ["tv_embedded", "tv", "ios", "android", "web"],
             }
         },
         # agar cookies.txt use karni ho (login-required/age-restricted videos ke liye):
