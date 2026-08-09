@@ -17,6 +17,7 @@ Render pe deploy:
 
 from fastapi import FastAPI, HTTPException, Query
 import os
+import requests
 import yt_dlp
 
 app = FastAPI(title="ytinfo-api")
@@ -28,7 +29,22 @@ app = FastAPI(title="ytinfo-api")
 BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
 
 
+def _warm_bgutil_provider():
+    """Render free tier pe bgutil-pot-provider bhi inactivity ke baad so
+    jaata hai. yt-dlp ka apna internal /ping timeout Render ke cold-start
+    delay (30-50s) se kam hai, isliye yt-dlp ke ping se PEHLE khud hi ek
+    lambe-timeout wala warm-up ping bhej dete hain — best-effort, fail ho
+    to bhi aage badhte hain (yt-dlp phir apna normal fallback try karega)."""
+    if not BGUTIL_PROVIDER_URL:
+        return
+    try:
+        requests.get(f"{BGUTIL_PROVIDER_URL}/ping", timeout=60)
+    except Exception:
+        pass
+
+
 def _extract(url: str) -> dict:
+    _warm_bgutil_provider()
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -126,6 +142,7 @@ def debug(url: str = Query(..., description="YouTube video URL")):
     hai to provider detect ho gaya hai. Agar isme 'not available' ya
     ye line hi missing hai, to provider connect nahi ho raha."""
     logger = _LogCapture()
+    _warm_bgutil_provider()
     ydl_opts = {
         "quiet": True,
         "no_warnings": False,
