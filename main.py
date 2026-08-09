@@ -30,9 +30,8 @@ BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
 
 def _extract(url: str) -> dict:
     ydl_opts = {
-        "quiet": False,
-        "no_warnings": False,
-        "verbose": True,  # DEBUG: temporary — check Render Logs tab after hitting /info
+        "quiet": True,
+        "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
         # "web" ab primary hai kyunki PO token (bgutil provider se) mil raha
@@ -97,6 +96,67 @@ def _split_formats(raw_formats: list) -> tuple[list, list]:
     audio.sort(key=lambda x: (x["abr"] or 0), reverse=True)
     video.sort(key=lambda x: (x["height"] or 0), reverse=True)
     return audio, video
+
+
+class _LogCapture:
+    """yt-dlp ke saare debug/warning/error messages ko capture karta hai
+    taaki hum unhe HTTP response me dekh sakein (Render free tier pe
+    Shell/SSH access nahi hota, isliye Logs tab ke alawa kahin aur se
+    dekhna mushkil hai)."""
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def debug(self, msg):
+        self.lines.append(msg)
+
+    def info(self, msg):
+        self.lines.append(msg)
+
+    def warning(self, msg):
+        self.lines.append(f"WARNING: {msg}")
+
+    def error(self, msg):
+        self.lines.append(f"ERROR: {msg}")
+
+
+@app.get("/debug")
+def debug(url: str = Query(..., description="YouTube video URL")):
+    """yt-dlp ka poora verbose log return karta hai — is line ko dhoondo:
+    'PO Token Providers: bgutil:http-x.x.x (external)' — agar ye line
+    hai to provider detect ho gaya hai. Agar isme 'not available' ya
+    ye line hi missing hai, to provider connect nahi ho raha."""
+    logger = _LogCapture()
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": False,
+        "verbose": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "logger": logger,
+        "extractor_args": {
+            "youtube": {"player_client": ["web", "tv_embedded", "ios", "android"]},
+            **({"youtubepot-bgutilhttp": {"base_url": BGUTIL_PROVIDER_URL}} if BGUTIL_PROVIDER_URL else {}),
+        },
+    }
+    extracted_ok = False
+    format_count = 0
+    error_msg = None
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info_data = ydl.extract_info(url, download=False)
+            extracted_ok = True
+            format_count = len(info_data.get("formats", []))
+    except Exception as e:
+        error_msg = str(e)
+
+    return {
+        "bgutil_provider_url_configured": bool(BGUTIL_PROVIDER_URL),
+        "bgutil_provider_url": BGUTIL_PROVIDER_URL or None,
+        "extracted_ok": extracted_ok,
+        "format_count": format_count,
+        "error": error_msg,
+        "logs": logger.lines,
+    }
 
 
 @app.get("/info")
