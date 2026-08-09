@@ -33,7 +33,7 @@ def _extract(url: str) -> dict:
         # usse pehle try karo, na chale to "web" pe fallback.
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["ios", "android", "web"],
             }
         },
         # agar cookies.txt use karni ho (login-required/age-restricted videos ke liye):
@@ -45,37 +45,45 @@ def _extract(url: str) -> dict:
 
 def _split_formats(raw_formats: list) -> tuple[list, list]:
     """Raw yt-dlp formats ko audio-only aur video-only me alag karta hai.
-    Combined (audio+video ek hi stream) formats ko yahan jaan-boojh kar
-    skip kiya hai kyunki bot khud audio-only + video-only alag download
-    karke ffmpeg se mux karega — usually behtar quality milti hai."""
-    audio, video = [], []
+    Combined (audio+video ek hi stream) formats ko jaan-boojh kar skip
+    kiya jaata hai kyunki bot khud audio-only + video-only alag download
+    karke ffmpeg se mux karega — usually behtar quality milti hai.
+    Agar koi bhi pure adaptive stream na mile (kuch player clients sirf
+    combined/progressive formats dete hain), to combined formats ko hi
+    dono list me fallback ke taur pe include kar diya jaata hai — taaki
+    API kabhi khaali response na de jab tak yt-dlp ne kuch bhi nikala ho."""
+    audio, video, combined = [], [], []
     for f in raw_formats:
         acodec = f.get("acodec")
         vcodec = f.get("vcodec")
         has_audio = acodec not in (None, "none")
         has_video = vcodec not in (None, "none")
 
+        entry = {
+            "itag":     f.get("format_id"),
+            "ext":      f.get("ext"),
+            "acodec":   acodec,
+            "vcodec":   vcodec,
+            "abr":      f.get("abr"),
+            "asr":      f.get("asr"),
+            "height":   f.get("height"),
+            "width":    f.get("width"),
+            "fps":      f.get("fps"),
+            "filesize": f.get("filesize") or f.get("filesize_approx"),
+            "url":      f.get("url"),
+        }
+
         if has_audio and not has_video:
-            audio.append({
-                "itag":     f.get("format_id"),
-                "ext":      f.get("ext"),
-                "acodec":   acodec,
-                "abr":      f.get("abr"),
-                "asr":      f.get("asr"),
-                "filesize": f.get("filesize") or f.get("filesize_approx"),
-                "url":      f.get("url"),
-            })
+            audio.append(entry)
         elif has_video and not has_audio:
-            video.append({
-                "itag":     f.get("format_id"),
-                "ext":      f.get("ext"),
-                "vcodec":   vcodec,
-                "height":   f.get("height"),
-                "width":    f.get("width"),
-                "fps":      f.get("fps"),
-                "filesize": f.get("filesize") or f.get("filesize_approx"),
-                "url":      f.get("url"),
-            })
+            video.append(entry)
+        elif has_audio and has_video:
+            combined.append(entry)
+
+    if not audio and not video and combined:
+        # Fallback: sirf combined formats mile — inhi ko dono list me de do.
+        audio = combined
+        video = combined
 
     audio.sort(key=lambda x: (x["abr"] or 0), reverse=True)
     video.sort(key=lambda x: (x["height"] or 0), reverse=True)
