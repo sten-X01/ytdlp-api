@@ -63,7 +63,7 @@ def _extract(url: str) -> dict:
         # (agar provider down ho to bhi kam-se-kam 360p muxed to milega).
         "extractor_args": {
             "youtube": {
-                "player_client": ["web", "ios", "android"],
+                "player_client": ["android", "web", "ios"],
             },
             **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
@@ -161,7 +161,7 @@ def debug(url: str = Query(..., description="YouTube video URL")):
         "noplaylist": True,
         "logger": logger,
         "extractor_args": {
-            "youtube": {"player_client": ["web", "ios", "android"]},
+            "youtube": {"player_client": ["android", "web", "ios"]},
             **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
     }
