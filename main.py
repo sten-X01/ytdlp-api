@@ -18,6 +18,7 @@ Render pe deploy:
 from fastapi import FastAPI, HTTPException, Query
 import os
 import requests
+import time
 import yt_dlp
 
 app = FastAPI(title="ytinfo-api")
@@ -29,18 +30,24 @@ app = FastAPI(title="ytinfo-api")
 BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
 
 
-def _warm_bgutil_provider():
+def _warm_bgutil_provider(retries: int = 3, delay_seconds: int = 5) -> bool:
     """Render free tier pe bgutil-pot-provider bhi inactivity ke baad so
-    jaata hai. yt-dlp ka apna internal /ping timeout Render ke cold-start
-    delay (30-50s) se kam hai, isliye yt-dlp ke ping se PEHLE khud hi ek
-    lambe-timeout wala warm-up ping bhej dete hain — best-effort, fail ho
-    to bhi aage badhte hain (yt-dlp phir apna normal fallback try karega)."""
+    jaata hai, aur kabhi-kabhi ek hi ping try karne se cold-start ke beech
+    502 mil jaata hai. Isliye ab ek nahi, teen attempts karte hain — jab
+    tak 200 OK na mile ya retries khatam na ho jaayein. Returns True/False
+    taaki /debug me confirm ho sake provider actually ready tha ya nahi."""
     if not BGUTIL_PROVIDER_URL:
-        return
-    try:
-        requests.get(f"{BGUTIL_PROVIDER_URL}/ping", timeout=60)
-    except Exception:
-        pass
+        return False
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(f"{BGUTIL_PROVIDER_URL}/ping", timeout=60)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        if attempt < retries:
+            time.sleep(delay_seconds)
+    return False
 
 
 def _extract(url: str) -> dict:
@@ -60,6 +67,10 @@ def _extract(url: str) -> dict:
             },
             **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
+        # yt-dlp by default sirf "deno" try karta hai (jo installed nahi hai)
+        # — quickjs (pip package) explicitly enable karna zaroori hai warna
+        # kabhi try hi nahi hoga chahe installed ho.
+        "js_runtimes": {"quickjs": {}},
         # agar cookies.txt use karni ho (login-required/age-restricted videos ke liye):
         # "cookiefile": "cookies.txt",
     }
@@ -142,7 +153,7 @@ def debug(url: str = Query(..., description="YouTube video URL")):
     hai to provider detect ho gaya hai. Agar isme 'not available' ya
     ye line hi missing hai, to provider connect nahi ho raha."""
     logger = _LogCapture()
-    _warm_bgutil_provider()
+    warm_up_ok = _warm_bgutil_provider()
     ydl_opts = {
         "quiet": True,
         "no_warnings": False,
@@ -154,6 +165,7 @@ def debug(url: str = Query(..., description="YouTube video URL")):
             "youtube": {"player_client": ["web", "ios", "android"]},
             **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
+        "js_runtimes": {"quickjs": {}},
     }
     extracted_ok = False
     format_count = 0
@@ -169,6 +181,7 @@ def debug(url: str = Query(..., description="YouTube video URL")):
     return {
         "bgutil_provider_url_configured": bool(BGUTIL_PROVIDER_URL),
         "bgutil_provider_url": BGUTIL_PROVIDER_URL or None,
+        "bgutil_warm_up_succeeded": warm_up_ok,
         "extracted_ok": extracted_ok,
         "format_count": format_count,
         "error": error_msg,
