@@ -3,4 +3,3 @@ uvicorn[standard]==0.30.6
 requests
 yt-dlp[default]
 bgutil-ytdlp-pot-provider
-quickjs
