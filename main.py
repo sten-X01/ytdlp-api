@@ -67,10 +67,9 @@ def _extract(url: str) -> dict:
             },
             **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
-        # yt-dlp by default sirf "deno" try karta hai (jo installed nahi hai)
-        # — quickjs (pip package) explicitly enable karna zaroori hai warna
-        # kabhi try hi nahi hoga chahe installed ho.
-        "js_runtimes": {"quickjs": {}},
+        # yt-dlp by default hi "deno" try karta hai — Render build command
+        # deno binary ko venv/bin me install karta hai (PATH pe rehta hai),
+        # isliye yahan explicit js_runtimes config ki zaroorat nahi.
         # agar cookies.txt use karni ho (login-required/age-restricted videos ke liye):
         # "cookiefile": "cookies.txt",
     }
@@ -165,7 +164,6 @@ def debug(url: str = Query(..., description="YouTube video URL")):
             "youtube": {"player_client": ["web", "ios", "android"]},
             **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
-        "js_runtimes": {"quickjs": {}},
     }
     extracted_ok = False
     format_count = 0
