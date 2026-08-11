@@ -58,7 +58,7 @@ def _extract(url: str) -> dict:
         "skip_download": True,
         "noplaylist": True,
         # "web" ab primary hai kyunki PO token (bgutil provider se) mil raha
-        # hai — isi client se full adaptive format list (144p-4320p video +
+        # hai — isi client se full adaptive format list(144p-4320p video +
         # sab audio bitrates) milti hai. Baaki clients sirf fallback hain
         # (agar provider down ho to bhi kam-se-kam 360p muxed to milega).
         "extractor_args": {
