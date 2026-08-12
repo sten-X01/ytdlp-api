@@ -28,17 +28,22 @@ if [ -n "$TS_AUTHKEY" ]; then
   echo "[start.sh] Starting tailscaled (userspace networking)..."
   ./tailscaled \
     --tun=userspace-networking \
+    --socket=/tmp/tailscaled.sock \
     --socks5-server=127.0.0.1:1055 \
     --outbound-http-proxy-listen=127.0.0.1:1055 \
     --state=/tmp/tailscaled.state \
     --statedir=/tmp \
     &
 
-  # tailscaled ko socket banane ke liye thoda time do
-  sleep 3
+  # tailscaled ka socket file banne tak wait karo (max ~15s), fixed
+  # sleep se better hai kyunki startup time thoda vary karta hai
+  for i in $(seq 1 15); do
+    [ -S /tmp/tailscaled.sock ] && break
+    sleep 1
+  done
 
   echo "[start.sh] Connecting to tailnet..."
-  ./tailscale up \
+  ./tailscale --socket=/tmp/tailscaled.sock up \
     --authkey="$TS_AUTHKEY" \
     --hostname="ytdlp-render" \
     --exit-node="${TS_EXIT_NODE_IP:-}" \
