@@ -107,7 +107,7 @@ def _base_ydl_opts(logger=None, verbose: bool = False) -> dict:
         "skip_download": True,
         "noplaylist": True,
         "extractor_args": {
-            "youtube": {"player_client": ["android", "web", "ios"]},
+            "youtube": {"player_client": ["tv", "mweb", "web"]},
             **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
     }
