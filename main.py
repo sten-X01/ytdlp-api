@@ -31,6 +31,19 @@ app = FastAPI(title="ytinfo-api")
 BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
 
 # ══════════════════════════════════════════════════════════════════════
+#   PROXY (Tailscale exit-node ke through) — mobile-IP se requests
+#   ─────────────────────────────────────────────────────────────────
+#   start.sh Render ke andar tailscaled ko "userspace-networking" mode
+#   me chalata hai jo localhost pe ek local SOCKS5 proxy expose karta
+#   hai (127.0.0.1:1055). Tailscale ka "tailscale up --exit-node=..."
+#   phone (jo exit node hai) ke through sab tailnet traffic route kar
+#   deta hai. Isliye yt-dlp ko sirf itna pata hona chahiye ki uska
+#   proxy 127.0.0.1:1055 hai — baaki tailscaled + phone sambhalte hain.
+#   Disable karna ho to Render env var PROXY_URL khaali chhod do.
+# ══════════════════════════════════════════════════════════════════════
+PROXY_URL = os.environ.get("PROXY_URL", "socks5h://127.0.0.1:1055").strip()
+
+# ══════════════════════════════════════════════════════════════════════
 #   COOKIE POOL — auto-rotating cookies system
 #   ─────────────────────────────────────────────────────────────────
 #   YouTube kabhi-kabhi "Sign in to confirm you're not a bot" degi
@@ -111,6 +124,8 @@ def _base_ydl_opts(logger=None, verbose: bool = False) -> dict:
             **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
     }
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
     if verbose:
         opts["verbose"] = True
     if logger is not None:
@@ -263,6 +278,7 @@ def debug(url: str = Query(..., description="YouTube video URL")):
             break
 
     return {
+        "proxy_configured": PROXY_URL or None,
         "bgutil_provider_url_configured": bool(BGUTIL_PROVIDER_URL),
         "bgutil_provider_url": BGUTIL_PROVIDER_URL or None,
         "bgutil_warm_up_succeeded": warm_up_ok,
@@ -436,3 +452,34 @@ def info(url: str = Query(..., description="YouTube video URL")):
 @app.get("/health")
 def health():
     return {"status": True}
+
+
+@app.get("/proxy/check")
+def proxy_check():
+    """Confirm karta hai ki Tailscale exit-node (phone) ke through traffic
+    fact me route ho raha hai ya nahi — dono IPs (direct Render IP vs
+    proxy ke through IP) dikhata hai. Agar dono same hain, matlab proxy
+    kaam nahi kar raha (tailscaled up nahi hua ya exit-node set nahi hua)."""
+    result = {"proxy_configured": PROXY_URL or None}
+    try:
+        result["render_direct_ip"] = requests.get("https://api.ipify.org", timeout=10).text
+    except Exception as e:
+        result["render_direct_ip"] = f"error: {e}"
+
+    if PROXY_URL:
+        try:
+            r = requests.get(
+                "https://api.ipify.org",
+                proxies={"http": PROXY_URL, "https": PROXY_URL},
+                timeout=15,
+            )
+            result["via_proxy_ip"] = r.text
+            result["tunnel_working"] = result["via_proxy_ip"] != result["render_direct_ip"]
+        except Exception as e:
+            result["via_proxy_ip"] = f"error: {e}"
+            result["tunnel_working"] = False
+    else:
+        result["via_proxy_ip"] = None
+        result["tunnel_working"] = None
+
+    return result
