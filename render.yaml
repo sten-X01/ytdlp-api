@@ -3,13 +3,6 @@ services:
     name: ytinfo-api
     env: python
     plan: free
-    buildCommand: |
-      pip install -r requirements.txt
-      TS_TARBALL=$(curl -fsSL "https://pkgs.tailscale.com/stable/?mode=json" | python3 -c "import sys,json; print(json.load(sys.stdin)['Tarballs']['amd64'])")
-      curl -fsSL "https://pkgs.tailscale.com/stable/${TS_TARBALL}" -o ts.tgz
-      tar -xzf ts.tgz
-      mv tailscale_*_amd64/tailscale tailscale_*_amd64/tailscaled .
-      chmod +x tailscale tailscaled
-      chmod +x start.sh
+    buildCommand: chmod +x build.sh && ./build.sh
     startCommand: ./start.sh
     healthCheckPath: /health
