@@ -293,7 +293,10 @@ def upload_cookies_form():
         input[type=file] { margin: 16px 0; display: block; }
         button { background: #16a34a; color: white; border: none; padding: 12px 20px;
                  border-radius: 6px; font-size: 16px; }
-        #result { margin-top: 16px; padding: 12px; border-radius: 6px; display: none; white-space: pre-wrap; }
+        #result { margin-top: 16px; padding: 12px; border-radius: 6px; display: none; white-space: pre-wrap; word-break: break-all; }
+        #envBox { margin-top: 12px; display: none; }
+        #envBox textarea { width: 100%; box-sizing: border-box; height: 100px; font-size: 12px; padding: 8px; }
+        #copyBtn { background: #2563eb; margin-top: 8px; }
       </style>
     </head>
     <body>
@@ -302,22 +305,31 @@ def upload_cookies_form():
       <input type="file" id="fileInput" accept=".txt">
       <button onclick="upload()">Upload</button>
       <div id="result"></div>
+      <div id="envBox">
+        <p><b>Permanent save karne ke liye:</b> ye value copy karo, Render → Environment tab me <code>COOKIES_1</code> (ya agla free number) naam se paste karo.</p>
+        <textarea id="envValue" readonly></textarea>
+        <button id="copyBtn" onclick="copyEnv()">Copy value</button>
+      </div>
       <script>
         async function upload() {
           const input = document.getElementById('fileInput');
           const resultBox = document.getElementById('result');
+          const envBox = document.getElementById('envBox');
           if (!input.files.length) { alert('Pehle file choose karo'); return; }
           const form = new FormData();
           form.append('file', input.files[0]);
           resultBox.style.display = 'block';
           resultBox.style.background = '#eee';
           resultBox.textContent = 'Uploading...';
+          envBox.style.display = 'none';
           try {
             const res = await fetch('/cookies/upload', { method: 'POST', body: form });
             const data = await res.json();
             if (res.ok) {
               resultBox.style.background = '#dcfce7';
-              resultBox.textContent = 'Success!\\n' + JSON.stringify(data, null, 2);
+              resultBox.textContent = 'Saved as: ' + data.saved_as + '\\nPool size: ' + data.pool_size;
+              document.getElementById('envValue').value = data.env_var_value;
+              envBox.style.display = 'block';
             } else {
               resultBox.style.background = '#fee2e2';
               resultBox.textContent = 'Failed:\\n' + JSON.stringify(data, null, 2);
@@ -326,6 +338,12 @@ def upload_cookies_form():
             resultBox.style.background = '#fee2e2';
             resultBox.textContent = 'Error: ' + e;
           }
+        }
+        function copyEnv() {
+          const box = document.getElementById('envValue');
+          box.select();
+          box.setSelectionRange(0, 99999);
+          navigator.clipboard.writeText(box.value).then(() => alert('Copied!'));
         }
       </script>
     </body>
@@ -338,8 +356,14 @@ def upload_cookies_form():
 async def upload_cookies(file: UploadFile = File(...)):
     """Naya cookies.txt (Netscape format, browser se 'Get cookies.txt
     LOCALLY' extension se export kiya hua) pool me add karta hai. Isi
-    URL pe file bhej do — turant pool me shaamil ho jaayegi, koi
-    redeploy nahi chahiye.
+    URL pe file bhej do — turant pool me shaamil ho jaayegi.
+
+    ⚠️ ZAROORI: Ye upload sirf tab tak zinda rehta hai jab tak service
+    redeploy nahi hoti (Render free tier me permanent disk nahi hota,
+    har naye deploy pe wipe ho jaata hai). Isliye response me mila
+    "env_var_value" copy karke Render dashboard → Environment tab me
+    COOKIES_1 (ya COOKIES_2, COOKIES_3...) naam se env var banao —
+    wo hamesha ke liye survive karega, chahe kitni bhi baar redeploy ho.
 
     curl -F "file=@cookies.txt" https://<your-api>/cookies/upload
     Ya phir browser se GET /cookies/upload wala form use karo.
@@ -353,7 +377,13 @@ async def upload_cookies(file: UploadFile = File(...)):
     with open(path, "wb") as f:
         f.write(contents)
 
-    return {"status": True, "saved_as": os.path.basename(path), "pool_size": len(_cookie_pool_paths())}
+    return {
+        "status": True,
+        "saved_as": os.path.basename(path),
+        "pool_size": len(_cookie_pool_paths()),
+        "note": "Ye upload agle redeploy pe udd jaayega. Neeche wali env_var_value copy karke Render → Environment tab me COOKIES_1 (ya agla free number) naam se save karo — tabhi permanent rahega.",
+        "env_var_value": base64.b64encode(contents).decode("ascii"),
+    }
 
 
 @app.get("/cookies/status")
