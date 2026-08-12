@@ -41,7 +41,7 @@ BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
 #   proxy 127.0.0.1:1055 hai — baaki tailscaled + phone sambhalte hain.
 #   Disable karna ho to Render env var PROXY_URL khaali chhod do.
 # ══════════════════════════════════════════════════════════════════════
-PROXY_URL = os.environ.get("PROXY_URL", "socks5h://127.0.0.1:1055").strip()
+PROXY_URL = os.environ.get("PROXY_URL", "socks5h://127.0.0.1:1090").strip()
 
 # ══════════════════════════════════════════════════════════════════════
 #   COOKIE POOL — auto-rotating cookies system
@@ -471,12 +471,12 @@ def proxy_check():
             r = requests.get(
                 "https://api.ipify.org",
                 proxies={"http": PROXY_URL, "https": PROXY_URL},
-                timeout=15,
+                timeout=20,
             )
             result["via_proxy_ip"] = r.text
             result["tunnel_working"] = result["via_proxy_ip"] != result["render_direct_ip"]
         except Exception as e:
-            result["via_proxy_ip"] = f"error: {e}"
+            result["via_proxy_ip"] = f"error: {type(e).__name__}: {e}"
             result["tunnel_working"] = False
     else:
         result["via_proxy_ip"] = None
