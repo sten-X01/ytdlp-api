@@ -1,54 +1,18 @@
 #!/bin/bash
-# ══════════════════════════════════════════════════════════════════════
-#   Render startup script
-#   ─────────────────────────────────────────────────────────────────
-#   1. tailscaled ko "userspace-networking" mode me chalata hai — isse
-#      root/TUN device ki zaroorat nahi padti (Render free container
-#      me wo permission nahi milti). Ye localhost:1055 pe ek local
-#      SOCKS5 proxy expose kar deta hai.
-#   2. tailscale up se is Render instance ko tailnet me jodta hai, aur
-#      phone (jo exit-node hai) ke through route set kar deta hai.
-#   3. Phir uvicorn start hota hai — yt-dlp ke saare requests ab
-#      127.0.0.1:1055 -> tailnet -> phone -> internet, is route se
-#      jaate hain (main.py me PROXY_URL isi ko point karta hai).
-#
-#   Zaroori env vars (Render dashboard -> Environment tab):
-#     TS_AUTHKEY        — Tailscale admin console -> Settings -> Keys
-#                          se banaya hua auth key. Reusable + Ephemeral
-#                          + Pre-authorized flags ON rakhna (taaki har
-#                          restart pe naya manual approval na maangna
-#                          pade aur purane dead nodes apne aap hat jayein).
-#     TS_EXIT_NODE_IP   — phone ka Tailscale IP (100.x.y.z), Tailscale
-#                          admin console (login.tailscale.com/admin/machines)
-#                          me phone ke naam ke niche dikhega.
-# ══════════════════════════════════════════════════════════════════════
+# Render dashboard ka "Build Command" field single-line hai — multi-line
+# command paste karne se saari lines bina separator ke chipak jaati hain
+# (isi wajah se pehle "no such option: -o" wala error aaya tha). Isliye
+# ye poora build logic ek script file me daal diya — Build Command me ab
+# sirf "chmod +x build.sh && ./build.sh" likhna hai.
 set -e
 
-if [ -n "$TS_AUTHKEY" ]; then
-  echo "[start.sh] Starting tailscaled (userspace networking)..."
-  ./tailscaled \
-    --tun=userspace-networking \
-    --socks5-server=127.0.0.1:1055 \
-    --outbound-http-proxy-listen=127.0.0.1:1055 \
-    --state=/tmp/tailscaled.state \
-    --statedir=/tmp \
-    &
+pip install -r requirements.txt
 
-  # tailscaled ko socket banane ke liye thoda time do
-  sleep 3
+TS_TARBALL=$(curl -fsSL "https://pkgs.tailscale.com/stable/?mode=json" | python3 -c "import sys,json; print(json.load(sys.stdin)['Tarballs']['amd64'])")
+curl -fsSL "https://pkgs.tailscale.com/stable/${TS_TARBALL}" -o ts.tgz
+tar -xzf ts.tgz
+mv tailscale_*_amd64/tailscale tailscale_*_amd64/tailscaled .
+chmod +x tailscale tailscaled
+chmod +x start.sh
 
-  echo "[start.sh] Connecting to tailnet..."
-  ./tailscale up \
-    --authkey="$TS_AUTHKEY" \
-    --hostname="ytdlp-render" \
-    --exit-node="${TS_EXIT_NODE_IP:-}" \
-    --exit-node-allow-lan-access=false \
-    --accept-dns=false \
-    --timeout=30s \
-    || echo "[start.sh] WARNING: tailscale up fail hua — proxy ke bina chal raha hai, cookies pe hi depend karega."
-else
-  echo "[start.sh] TS_AUTHKEY set nahi hai — Tailscale skip, direct connection use hoga."
-fi
-
-echo "[start.sh] Starting API server..."
-exec uvicorn main:app --host 0.0.0.0 --port "$PORT"
+echo "[build.sh] Build complete."
