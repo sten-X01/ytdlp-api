@@ -43,14 +43,33 @@ if [ -n "$TS_AUTHKEY" ]; then
   done
 
   echo "[start.sh] Connecting to tailnet..."
+  # NOTE: --exit-node yahan jaan-boojh kar NAHI use kiya — Render jaise
+  # userspace-networking containers me "exit node" feature Tailscale ka
+  # ek known/unfixed limitation hai (traffic actually route nahi hota,
+  # chahe status "connected" dikhaye). Iske bajaye hum seedha phone ke
+  # apne proxy server (Termux/pproxy, TS_PHONE_PROXY_PORT par) tak ek
+  # do-hop chain banate hain neeche.
   ./tailscale --socket=/tmp/tailscaled.sock up \
     --authkey="$TS_AUTHKEY" \
     --hostname="ytdlp-render" \
-    --exit-node="${TS_EXIT_NODE_IP:-}" \
-    --exit-node-allow-lan-access=false \
     --accept-dns=false \
     --timeout=30s \
     || echo "[start.sh] WARNING: tailscale up fail hua — proxy ke bina chal raha hai, cookies pe hi depend karega."
+
+  # Phone khud Termux me ek pproxy SOCKS5 server chala raha hai
+  # (0.0.0.0:${TS_PHONE_PROXY_PORT:-1080}) apne Tailscale IP par.
+  # Render seedha us IP tak nahi pahunch sakta (koi TUN/route nahi),
+  # isliye ek chained pproxy banate hain: pehle tailscaled ke apne
+  # local socks5 (127.0.0.1:1055) se tailnet me jao, phir wahan se
+  # jump karke phone ke proxy tak pahuncho. Final result ek naya
+  # local proxy 127.0.0.1:1090 hai jise main.py use karta hai.
+  if [ -n "$TS_EXIT_NODE_IP" ]; then
+    echo "[start.sh] Starting proxy chain to phone (${TS_EXIT_NODE_IP})..."
+    python3 -m pproxy \
+      -l "socks5://127.0.0.1:1090" \
+      -r "socks5://127.0.0.1:1055__socks5://${TS_EXIT_NODE_IP}:${TS_PHONE_PROXY_PORT:-1080}" \
+      &
+  fi
 else
   echo "[start.sh] TS_AUTHKEY set nahi hai — Tailscale skip, direct connection use hoga."
 fi
