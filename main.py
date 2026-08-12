@@ -275,6 +275,65 @@ def debug(url: str = Query(..., description="YouTube video URL")):
     }
 
 
+@app.get("/cookies/upload")
+def upload_cookies_form():
+    """Mobile browser se seedha cookies.txt upload karne ka simple page —
+    terminal/curl ki zaroorat nahi. Isi URL ko phone ke browser me kholo."""
+    from fastapi.responses import HTMLResponse
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Cookies Upload</title>
+      <style>
+        body { font-family: sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
+        h2 { margin-bottom: 4px; }
+        p { color: #555; }
+        input[type=file] { margin: 16px 0; display: block; }
+        button { background: #16a34a; color: white; border: none; padding: 12px 20px;
+                 border-radius: 6px; font-size: 16px; }
+        #result { margin-top: 16px; padding: 12px; border-radius: 6px; display: none; white-space: pre-wrap; }
+      </style>
+    </head>
+    <body>
+      <h2>Cookies Upload</h2>
+      <p>Apni exported <b>cookies.txt</b> file yahan choose karke Upload dabao.</p>
+      <input type="file" id="fileInput" accept=".txt">
+      <button onclick="upload()">Upload</button>
+      <div id="result"></div>
+      <script>
+        async function upload() {
+          const input = document.getElementById('fileInput');
+          const resultBox = document.getElementById('result');
+          if (!input.files.length) { alert('Pehle file choose karo'); return; }
+          const form = new FormData();
+          form.append('file', input.files[0]);
+          resultBox.style.display = 'block';
+          resultBox.style.background = '#eee';
+          resultBox.textContent = 'Uploading...';
+          try {
+            const res = await fetch('/cookies/upload', { method: 'POST', body: form });
+            const data = await res.json();
+            if (res.ok) {
+              resultBox.style.background = '#dcfce7';
+              resultBox.textContent = 'Success!\\n' + JSON.stringify(data, null, 2);
+            } else {
+              resultBox.style.background = '#fee2e2';
+              resultBox.textContent = 'Failed:\\n' + JSON.stringify(data, null, 2);
+            }
+          } catch (e) {
+            resultBox.style.background = '#fee2e2';
+            resultBox.textContent = 'Error: ' + e;
+          }
+        }
+      </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
 @app.post("/cookies/upload")
 async def upload_cookies(file: UploadFile = File(...)):
     """Naya cookies.txt (Netscape format, browser se 'Get cookies.txt
@@ -283,6 +342,7 @@ async def upload_cookies(file: UploadFile = File(...)):
     redeploy nahi chahiye.
 
     curl -F "file=@cookies.txt" https://<your-api>/cookies/upload
+    Ya phir browser se GET /cookies/upload wala form use karo.
     """
     contents = await file.read()
     if not contents or b"\t" not in contents:
