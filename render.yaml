@@ -3,6 +3,6 @@ services:
     name: ytinfo-api
     env: python
     plan: free
-    buildCommand: chmod +x build.sh && ./build.sh
-    startCommand: ./start.sh
+    buildCommand: pip install -r requirements.txt && curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip && unzip -o /tmp/deno.zip -d /opt/render/project/src/.venv/bin && chmod +x /opt/render/project/src/.venv/bin/deno
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
