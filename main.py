@@ -126,6 +126,14 @@ def _base_ydl_opts(logger=None, verbose: bool = False) -> dict:
     }
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
+        # Phone Tailscale ke CGNAT/DERP relay ke peeche hai, isliye connection
+        # kabhi-kabhi flaky ho sakta hai — extra retries aur bada timeout
+        # rakhte hain taaki ek-do baar bhi bhale hi thoda time lage, request
+        # fail na ho.
+        opts["socket_timeout"] = 30
+        opts["retries"] = 5
+        opts["fragment_retries"] = 5
+        opts["extractor_retries"] = 3
     if verbose:
         opts["verbose"] = True
     if logger is not None:
@@ -467,16 +475,28 @@ def proxy_check():
         result["render_direct_ip"] = f"error: {e}"
 
     if PROXY_URL:
-        try:
-            r = requests.get(
-                "https://api.ipify.org",
-                proxies={"http": PROXY_URL, "https": PROXY_URL},
-                timeout=20,
-            )
-            result["via_proxy_ip"] = r.text
-            result["tunnel_working"] = result["via_proxy_ip"] != result["render_direct_ip"]
-        except Exception as e:
-            result["via_proxy_ip"] = f"error: {type(e).__name__}: {e}"
+        # Phone Tailscale ke DERP relay/CGNAT ke peeche hai, isliye connection
+        # kabhi-kabhi pehli koshish me flaky ho sakta hai. Kai attempts karke
+        # dekhte hain ki ye permanently broken hai ya sirf intermittent hai.
+        attempts = []
+        for i in range(4):
+            try:
+                r = requests.get(
+                    "https://api.ipify.org",
+                    proxies={"http": PROXY_URL, "https": PROXY_URL},
+                    timeout=20,
+                )
+                attempts.append({"attempt": i + 1, "ok": True, "ip": r.text})
+            except Exception as e:
+                attempts.append({"attempt": i + 1, "ok": False, "error": f"{type(e).__name__}: {e}"})
+        result["attempts"] = attempts
+        successes = [a for a in attempts if a["ok"]]
+        result["success_rate"] = f"{len(successes)}/{len(attempts)}"
+        if successes:
+            result["via_proxy_ip"] = successes[-1]["ip"]
+            result["tunnel_working"] = successes[-1]["ip"] != result["render_direct_ip"]
+        else:
+            result["via_proxy_ip"] = attempts[-1].get("error")
             result["tunnel_working"] = False
     else:
         result["via_proxy_ip"] = None
