@@ -15,7 +15,7 @@ Render pe deploy:
     Start Command : uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Depends, Header
 import base64
 import os
 import requests
@@ -24,24 +24,30 @@ import yt_dlp
 
 app = FastAPI(title="ytinfo-api")
 
+# ── API Key protection ──────────────────────────────────────────────
+# Render dashboard → Environment → API_KEY set karo (koi bhi random
+# lamba string). Uske baad har request me ?apikey=... ya X-API-Key
+# header dena zaroori hoga. Agar API_KEY set hi na karo to protection
+# off rehta hai (jaisa pehle tha) — set karne ki strongly salaah hai
+# warna koi bhi tumhari API free me use kar sakta hai.
+API_KEY = os.environ.get("API_KEY", "").strip()
+
+
+def require_api_key(
+    apikey: str | None = Query(None),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+):
+    if not API_KEY:
+        return
+    if (apikey or x_api_key) != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key. Pass ?apikey=... or X-API-Key header.")
+
+
 # bgutil-ytdlp-pot-provider ka HTTP server URL — Render dashboard me
 # "Environment" tab se BGUTIL_PROVIDER_URL naam ka env var set karo
 # (e.g. https://bgutil-pot-provider-xxxx.onrender.com). Isse PO token
 # milta hai jo "web" client ko full quality formats dene deta hai.
 BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
-
-# ══════════════════════════════════════════════════════════════════════
-#   PROXY (Tailscale exit-node ke through) — mobile-IP se requests
-#   ─────────────────────────────────────────────────────────────────
-#   start.sh Render ke andar tailscaled ko "userspace-networking" mode
-#   me chalata hai jo localhost pe ek local SOCKS5 proxy expose karta
-#   hai (127.0.0.1:1055). Tailscale ka "tailscale up --exit-node=..."
-#   phone (jo exit node hai) ke through sab tailnet traffic route kar
-#   deta hai. Isliye yt-dlp ko sirf itna pata hona chahiye ki uska
-#   proxy 127.0.0.1:1055 hai — baaki tailscaled + phone sambhalte hain.
-#   Disable karna ho to Render env var PROXY_URL khaali chhod do.
-# ══════════════════════════════════════════════════════════════════════
-PROXY_URL = os.environ.get("PROXY_URL", "socks5h://127.0.0.1:1090").strip()
 
 # ══════════════════════════════════════════════════════════════════════
 #   COOKIE POOL — auto-rotating cookies system
@@ -81,21 +87,27 @@ def _is_auth_error(exc: Exception) -> bool:
 
 def _load_env_cookie_pool():
     """COOKIES_1, COOKIES_2, ... env vars (base64-encoded cookies.txt
-    content) ko ek baar disk pe likh deta hai. Render dashboard se ye
-    env vars set karo — value = poore cookies.txt file ko base64 me
-    encode karke paste kar do."""
+    content) ko disk pe likhta hai — LEKIN SIRF agar file already exist
+    nahi karti. Ye zaroori hai: yt-dlp har request ke baad is file me
+    refreshed session tokens WAPAS likh deta hai (--cookies FILE load
+    bhi karta hai aur save bhi usi file me). Agar hum har restart pe
+    env var se dobara overwrite kar dete, to wo refresh hamesha udd
+    jaata — isi wajah se cookies 'jaldi expire' hoti dikh rahi thi.
+    Ab sirf pehli baar (fresh deploy ke baad) seed hoga, uske baad
+    file khud-ba-khud apne aap fresh rehti hai."""
     i = 1
     while True:
         val = os.environ.get(f"COOKIES_{i}")
         if not val:
             break
-        try:
-            content = base64.b64decode(val).decode("utf-8")
-            path = os.path.join(COOKIE_DIR, f"env_{i}.txt")
-            with open(path, "w") as f:
-                f.write(content)
-        except Exception:
-            pass
+        path = os.path.join(COOKIE_DIR, f"env_{i}.txt")
+        if not os.path.exists(path):
+            try:
+                content = base64.b64decode(val).decode("utf-8")
+                with open(path, "w") as f:
+                    f.write(content)
+            except Exception:
+                pass
         i += 1
 
 
@@ -124,16 +136,6 @@ def _base_ydl_opts(logger=None, verbose: bool = False) -> dict:
             **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
     }
-    if PROXY_URL:
-        opts["proxy"] = PROXY_URL
-        # Phone ke mobile-data chain (Tailscale relay + double-hop proxy) me
-        # latency zyada hoti hai. Bahut zyada retries/timeout se ek hi
-        # request minutes tak khinch sakti hai — isliye halka rakha hai
-        # taaki jaldi result mile ya jaldi fail ho (fir bot dobara try kar le).
-        opts["socket_timeout"] = 15
-        opts["retries"] = 2
-        opts["fragment_retries"] = 2
-        opts["extractor_retries"] = 1
     if verbose:
         opts["verbose"] = True
     if logger is not None:
@@ -286,7 +288,6 @@ def debug(url: str = Query(..., description="YouTube video URL")):
             break
 
     return {
-        "proxy_configured": PROXY_URL or None,
         "bgutil_provider_url_configured": bool(BGUTIL_PROVIDER_URL),
         "bgutil_provider_url": BGUTIL_PROVIDER_URL or None,
         "bgutil_warm_up_succeeded": warm_up_ok,
@@ -460,46 +461,3 @@ def info(url: str = Query(..., description="YouTube video URL")):
 @app.get("/health")
 def health():
     return {"status": True}
-
-
-@app.get("/proxy/check")
-def proxy_check():
-    """Confirm karta hai ki Tailscale exit-node (phone) ke through traffic
-    fact me route ho raha hai ya nahi — dono IPs (direct Render IP vs
-    proxy ke through IP) dikhata hai. Agar dono same hain, matlab proxy
-    kaam nahi kar raha (tailscaled up nahi hua ya exit-node set nahi hua)."""
-    result = {"proxy_configured": PROXY_URL or None}
-    try:
-        result["render_direct_ip"] = requests.get("https://api.ipify.org", timeout=10).text
-    except Exception as e:
-        result["render_direct_ip"] = f"error: {e}"
-
-    if PROXY_URL:
-        # Phone Tailscale ke DERP relay/CGNAT ke peeche hai, isliye connection
-        # kabhi-kabhi pehli koshish me flaky ho sakta hai. Kai attempts karke
-        # dekhte hain ki ye permanently broken hai ya sirf intermittent hai.
-        attempts = []
-        for i in range(4):
-            try:
-                r = requests.get(
-                    "https://api.ipify.org",
-                    proxies={"http": PROXY_URL, "https": PROXY_URL},
-                    timeout=20,
-                )
-                attempts.append({"attempt": i + 1, "ok": True, "ip": r.text})
-            except Exception as e:
-                attempts.append({"attempt": i + 1, "ok": False, "error": f"{type(e).__name__}: {e}"})
-        result["attempts"] = attempts
-        successes = [a for a in attempts if a["ok"]]
-        result["success_rate"] = f"{len(successes)}/{len(attempts)}"
-        if successes:
-            result["via_proxy_ip"] = successes[-1]["ip"]
-            result["tunnel_working"] = successes[-1]["ip"] != result["render_direct_ip"]
-        else:
-            result["via_proxy_ip"] = attempts[-1].get("error")
-            result["tunnel_working"] = False
-    else:
-        result["via_proxy_ip"] = None
-        result["tunnel_working"] = None
-
-    return result
