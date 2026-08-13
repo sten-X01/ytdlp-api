@@ -65,7 +65,7 @@ if [ -n "$TS_AUTHKEY" ]; then
   # local proxy 127.0.0.1:1090 hai jise main.py use karta hai.
   if [ -n "$TS_EXIT_NODE_IP" ]; then
     echo "[start.sh] Starting proxy chain to phone (${TS_EXIT_NODE_IP})..."
-    python3 -m pproxy \
+    python3 run_pproxy.py \
       -l "socks5://127.0.0.1:1090" \
       -r "socks5://127.0.0.1:1055__socks5://${TS_EXIT_NODE_IP}:${TS_PHONE_PROXY_PORT:-1080}" \
       &
