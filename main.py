@@ -126,14 +126,14 @@ def _base_ydl_opts(logger=None, verbose: bool = False) -> dict:
     }
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
-        # Phone Tailscale ke CGNAT/DERP relay ke peeche hai, isliye connection
-        # kabhi-kabhi flaky ho sakta hai — extra retries aur bada timeout
-        # rakhte hain taaki ek-do baar bhi bhale hi thoda time lage, request
-        # fail na ho.
-        opts["socket_timeout"] = 30
-        opts["retries"] = 5
-        opts["fragment_retries"] = 5
-        opts["extractor_retries"] = 3
+        # Phone ke mobile-data chain (Tailscale relay + double-hop proxy) me
+        # latency zyada hoti hai. Bahut zyada retries/timeout se ek hi
+        # request minutes tak khinch sakti hai — isliye halka rakha hai
+        # taaki jaldi result mile ya jaldi fail ho (fir bot dobara try kar le).
+        opts["socket_timeout"] = 15
+        opts["retries"] = 2
+        opts["fragment_retries"] = 2
+        opts["extractor_retries"] = 1
     if verbose:
         opts["verbose"] = True
     if logger is not None:
