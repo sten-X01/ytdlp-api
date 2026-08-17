@@ -1,7 +1,9 @@
 """
 Render pe deploy karne wala YouTube info API.
-Kaam sirf itna: yt-dlp se video ka info nikalna aur audio-only /
-video-only formats ki list (with direct CDN url) return karna.
+Kaam: yt-dlp se video/playlist/search ka info nikalna aur HAR tarah ke
+formats (audio-only, video-only, combined/muxed — a-to-z sab) ki list
+with direct CDN url return karna, saath me subtitles, thumbnails,
+chapters, playlist aur search bhi.
 Downloading, transcoding, muxing — sab kuch bot side pe hota hai,
 ye API sirf "info + urls" deta hai.
 
@@ -16,13 +18,22 @@ Render pe deploy:
 """
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
 import base64
 import os
 import requests
 import time
 import yt_dlp
 
-app = FastAPI(title="ytinfo-api")
+app = FastAPI(title="ytinfo-api", version="2.0")
+
+# Browser / webapp se seedha call karna ho to CORS khula rakha hai.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── API Key protection ──────────────────────────────────────────────
 # Render dashboard → Environment → API_KEY set karo (koi bhi random
@@ -30,6 +41,10 @@ app = FastAPI(title="ytinfo-api")
 # header dena zaroori hoga. Agar API_KEY set hi na karo to protection
 # off rehta hai (jaisa pehle tha) — set karne ki strongly salaah hai
 # warna koi bhi tumhari API free me use kar sakta hai.
+#
+# NOTE: pehle ye function bana hua tha lekin kisi bhi route pe laga
+# hua nahi tha (bug) — ab har data-returning route pe Depends() laga
+# diya gaya hai, taaki API_KEY set karne ka matlab ho.
 API_KEY = os.environ.get("API_KEY", "").strip()
 
 
@@ -163,11 +178,16 @@ def _warm_bgutil_provider(retries: int = 3, delay_seconds: int = 5) -> bool:
     return False
 
 
-def _extract(url: str) -> dict:
+def _extract(url: str, extra_opts: dict | None = None) -> dict:
     """Cookie pool ke har set ko baari-baari try karta hai (aur ek attempt
     bina cookies ke bhi, kyunki kabhi-kabhi wo bhi chal jaata hai). Sirf
     auth-error (LOGIN_REQUIRED) pe hi next cookie try karta hai — koi aur
-    error ho to turant raise kar deta hai, chhupata nahi."""
+    error ho to turant raise kar deta hai, chhupata nahi.
+
+    extra_opts se yt-dlp options override/add kiye ja sakte hain — jaise
+    playlist extraction ke liye noplaylist:False, ya search ke liye
+    extract_flat, jisse ek hi function playlist/search/single-video sab
+    ke liye reuse ho sake."""
     _warm_bgutil_provider()
     cookie_paths = _cookie_pool_paths()
     attempts = cookie_paths + [None]  # None = cookies ke bina, last resort
@@ -175,6 +195,8 @@ def _extract(url: str) -> dict:
     last_error = None
     for cookiefile in attempts:
         opts = _base_ydl_opts()
+        if extra_opts:
+            opts.update(extra_opts)
         if cookiefile:
             opts["cookiefile"] = cookiefile
         try:
@@ -188,51 +210,172 @@ def _extract(url: str) -> dict:
     raise last_error
 
 
-def _split_formats(raw_formats: list) -> tuple[list, list]:
-    """Raw yt-dlp formats ko audio-only aur video-only me alag karta hai.
-    Combined (audio+video ek hi stream) formats ko jaan-boojh kar skip
-    kiya jaata hai kyunki bot khud audio-only + video-only alag download
-    karke ffmpeg se mux karega — usually behtar quality milti hai.
-    Agar koi bhi pure adaptive stream na mile (kuch player clients sirf
-    combined/progressive formats dete hain), to combined formats ko hi
-    dono list me fallback ke taur pe include kar diya jaata hai — taaki
-    API kabhi khaali response na de jab tak yt-dlp ne kuch bhi nikala ho."""
+# ══════════════════════════════════════════════════════════════════════
+#   FORMAT HELPERS — audio / video / combined, A to Z detail ke saath
+# ══════════════════════════════════════════════════════════════════════
+
+def _human_size(num) -> str | None:
+    """Bytes ko readable string me convert karta hai (e.g. '4.7 MB')."""
+    if not num:
+        return None
+    num = float(num)
+    for unit in ("B", "KB", "MB", "GB"):
+        if num < 1024:
+            return f"{num:.1f} {unit}" if unit != "B" else f"{int(num)} B"
+        num /= 1024
+    return f"{num:.1f} TB"
+
+
+def _quality_label(f: dict) -> str:
+    """Insaan-padhne-layak quality label banata hai — jaise '1080p60',
+    '720p', '160kbps' — yt-dlp ke raw format_note se zyada consistent."""
+    height = f.get("height")
+    fps = f.get("fps")
+    abr = f.get("abr")
+    vcodec = f.get("vcodec")
+    acodec = f.get("acodec")
+    has_video = vcodec not in (None, "none")
+    has_audio = acodec not in (None, "none")
+
+    if has_video and height:
+        label = f"{height}p"
+        if fps and fps > 30:
+            label += str(int(fps))
+        dr = f.get("dynamic_range")
+        if dr and dr != "SDR":
+            label += f" {dr}"
+        return label
+    if has_audio and abr:
+        return f"{int(round(abr))}kbps"
+    return f.get("format_note") or f.get("format_id") or "unknown"
+
+
+def _format_entry(f: dict) -> dict:
+    """Ek raw yt-dlp format dict ko poori detail wale clean dict me
+    convert karta hai — audio, video, ya combined, sabke liye same
+    shape (jo fields kisi format pe apply nahi hoti wo None rehti hain)."""
+    acodec = f.get("acodec")
+    vcodec = f.get("vcodec")
+    has_audio = acodec not in (None, "none")
+    has_video = vcodec not in (None, "none")
+    filesize = f.get("filesize") or f.get("filesize_approx")
+
+    if has_audio and has_video:
+        kind = "combined"
+    elif has_audio:
+        kind = "audio"
+    elif has_video:
+        kind = "video"
+    else:
+        kind = "other"  # storyboards / mhtml preview strips waghera
+
+    return {
+        "itag":              f.get("format_id"),
+        "type":              kind,
+        "ext":               f.get("ext"),
+        "container":         f.get("ext"),
+        "format_note":       f.get("format_note"),
+        "quality_label":     _quality_label(f),
+        "acodec":            acodec,
+        "vcodec":            vcodec,
+        "protocol":          f.get("protocol"),
+        "tbr_kbps":          f.get("tbr"),
+        "abr_kbps":          f.get("abr"),
+        "vbr_kbps":          f.get("vbr"),
+        "asr_hz":            f.get("asr"),
+        "height":            f.get("height"),
+        "width":             f.get("width"),
+        "fps":               f.get("fps"),
+        "dynamic_range":     f.get("dynamic_range"),
+        "audio_channels":    f.get("audio_channels"),
+        "language":          f.get("language"),
+        "filesize_bytes":    filesize,
+        "filesize_readable": _human_size(filesize),
+        "is_live":           bool(f.get("is_live")),
+        "url":               f.get("url"),
+    }
+
+
+def _split_formats(raw_formats: list) -> tuple[list, list, list]:
+    """Raw yt-dlp formats ko teen categories me baantata hai:
+      • audio  → audio-only streams (koi video nahi)
+      • video  → video-only streams (koi audio nahi)
+      • combined → ek hi stream me audio+video dono (progressive/muxed,
+        jaise purana 360p mp4, ya live streams)
+    Pehle combined skip ho jaata tha; ab A-to-Z coverage ke liye teeno
+    return kiye jaate hain taaki bot jo bhi chahe use kar sake — agar
+    seedha ek hi file chahiye (bina ffmpeg mux ke) to combined kaam
+    aayega, agar best quality chahiye to audio-only + video-only mux
+    karna hi behtar rehta hai (YouTube high quality sirf adaptive
+    streams me deta hai)."""
     audio, video, combined = [], [], []
     for f in raw_formats:
-        acodec = f.get("acodec")
-        vcodec = f.get("vcodec")
-        has_audio = acodec not in (None, "none")
-        has_video = vcodec not in (None, "none")
-
-        entry = {
-            "itag":     f.get("format_id"),
-            "ext":      f.get("ext"),
-            "acodec":   acodec,
-            "vcodec":   vcodec,
-            "abr":      f.get("abr"),
-            "asr":      f.get("asr"),
-            "height":   f.get("height"),
-            "width":    f.get("width"),
-            "fps":      f.get("fps"),
-            "filesize": f.get("filesize") or f.get("filesize_approx"),
-            "url":      f.get("url"),
-        }
-
-        if has_audio and not has_video:
+        entry = _format_entry(f)
+        if entry["type"] == "audio":
             audio.append(entry)
-        elif has_video and not has_audio:
+        elif entry["type"] == "video":
             video.append(entry)
-        elif has_audio and has_video:
+        elif entry["type"] == "combined":
             combined.append(entry)
+        # "other" (storyboards etc.) jaan-boojh kar drop kiya jaata hai
 
-    if not audio and not video and combined:
-        # Fallback: sirf combined formats mile — inhi ko dono list me de do.
-        audio = combined
-        video = combined
+    audio.sort(key=lambda x: (x["abr_kbps"] or 0), reverse=True)
+    video.sort(key=lambda x: (x["height"] or 0, x["fps"] or 0), reverse=True)
+    combined.sort(key=lambda x: (x["height"] or 0), reverse=True)
+    return audio, video, combined
 
-    audio.sort(key=lambda x: (x["abr"] or 0), reverse=True)
-    video.sort(key=lambda x: (x["height"] or 0), reverse=True)
-    return audio, video
+
+def _filter_formats(
+    formats: list,
+    ext: str | None = None,
+    min_height: int | None = None,
+    max_height: int | None = None,
+    min_abr: float | None = None,
+) -> list:
+    """/info aur /best pe optional query filters lagane ke liye —
+    e.g. ?ext=mp4 ya ?min_height=720 se sirf matching formats milte hain."""
+    out = formats
+    if ext:
+        wanted = {e.strip().lower() for e in ext.split(",") if e.strip()}
+        out = [f for f in out if (f.get("ext") or "").lower() in wanted]
+    if min_height is not None:
+        out = [f for f in out if (f.get("height") or 0) >= min_height]
+    if max_height is not None:
+        out = [f for f in out if (f.get("height") or 0) <= max_height]
+    if min_abr is not None:
+        out = [f for f in out if (f.get("abr_kbps") or 0) >= min_abr]
+    return out
+
+
+def _extract_subs(data: dict, auto: bool = False) -> dict:
+    """info dict se subtitles / auto-captions ko clean {lang: [entries]}
+    shape me nikalta hai."""
+    src = data.get("automatic_captions") if auto else data.get("subtitles")
+    src = src or {}
+    return {
+        lang: [
+            {"ext": s.get("ext"), "name": s.get("name"), "url": s.get("url")}
+            for s in items
+        ]
+        for lang, items in src.items()
+    }
+
+
+def _thumbnails(data: dict) -> list:
+    thumbs = data.get("thumbnails") or []
+    return [
+        {"url": t.get("url"), "width": t.get("width"), "height": t.get("height")}
+        for t in thumbs
+        if t.get("url")
+    ]
+
+
+def _chapters(data: dict) -> list:
+    chapters = data.get("chapters") or []
+    return [
+        {"title": c.get("title"), "start_time": c.get("start_time"), "end_time": c.get("end_time")}
+        for c in chapters
+    ]
 
 
 class _LogCapture:
@@ -256,8 +399,257 @@ class _LogCapture:
         self.lines.append(f"ERROR: {msg}")
 
 
+# ══════════════════════════════════════════════════════════════════════
+#   ROUTES
+# ══════════════════════════════════════════════════════════════════════
+
+@app.get("/")
+def root():
+    """Chhota index — kaun se endpoints available hain."""
+    return {
+        "status": True,
+        "name": "ytinfo-api",
+        "version": "2.0",
+        "endpoints": {
+            "GET /info":            "Single video ka poora info + audio/video/combined formats",
+            "GET /best":            "Ek video, ek audio format — quickest 'best pick' shortcut",
+            "GET /formats":         "Sirf format list (halka payload, metadata ke bina)",
+            "GET /subtitles":       "Available subtitle/caption languages + direct URLs",
+            "GET /playlist":        "Playlist ke andar ki videos ki list",
+            "GET /search":          "YouTube search results",
+            "GET /debug":           "Verbose extraction log (troubleshooting ke liye)",
+            "GET /cookies/status":  "Cookie pool me kaunsi cookies zinda hain",
+            "GET /cookies/upload":  "Mobile browser se cookies.txt upload karne ka form",
+            "POST /cookies/upload": "cookies.txt file upload (multipart/form-data)",
+            "GET /health":          "Health check",
+        },
+    }
+
+
+@app.get("/info")
+def info(
+    url: str = Query(..., description="YouTube video URL"),
+    ext: str | None = Query(None, description="Comma-separated container filter, e.g. mp4,webm"),
+    min_height: int | None = Query(None, description="Video formats ko is height se kam skip kar do"),
+    max_height: int | None = Query(None, description="Video formats ko is height se zyada skip kar do"),
+    min_abr: float | None = Query(None, description="Audio formats ko is bitrate (kbps) se kam skip kar do"),
+    include_subs: bool = Query(False, description="Response me subtitles + auto-captions bhi jodo"),
+    include_chapters: bool = Query(True, description="Response me chapters jodo (agar available hon)"),
+    _auth=Depends(require_api_key),
+):
+    try:
+        data = _extract(url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
+
+    audio, video, combined = _split_formats(data.get("formats", []))
+    audio = _filter_formats(audio, ext=ext, min_abr=min_abr)
+    video = _filter_formats(video, ext=ext, min_height=min_height, max_height=max_height)
+    combined = _filter_formats(combined, ext=ext, min_height=min_height, max_height=max_height)
+
+    if not audio and not video and not combined:
+        raise HTTPException(status_code=502, detail="No downloadable formats found")
+
+    best_audio = audio[0] if audio else (combined[0] if combined else None)
+    best_video = video[0] if video else (combined[0] if combined else None)
+
+    result = {
+        "status":            True,
+        "videoId":           data.get("id"),
+        "title":             data.get("title"),
+        "description":       data.get("description"),
+        "thumbnail":         data.get("thumbnail"),
+        "thumbnails":        _thumbnails(data),
+        "duration":          data.get("duration"),
+        "duration_string":   data.get("duration_string"),
+        "uploader":          data.get("uploader"),
+        "uploader_id":       data.get("uploader_id"),
+        "channel_url":       data.get("channel_url"),
+        "upload_date":       data.get("upload_date"),
+        "view_count":        data.get("view_count"),
+        "like_count":        data.get("like_count"),
+        "comment_count":     data.get("comment_count"),
+        "categories":        data.get("categories"),
+        "tags":              data.get("tags"),
+        "is_live":           bool(data.get("is_live")),
+        "was_live":          bool(data.get("was_live")),
+        "availability":      data.get("availability"),
+        "age_limit":         data.get("age_limit"),
+        "audio_formats":     audio,
+        "video_formats":     video,
+        "combined_formats":  combined,
+        "best": {
+            "audio": best_audio,
+            "video": best_video,
+        },
+    }
+    if include_chapters:
+        result["chapters"] = _chapters(data)
+    if include_subs:
+        result["subtitles"] = _extract_subs(data, auto=False)
+        result["automatic_captions"] = _extract_subs(data, auto=True)
+
+    return result
+
+
+@app.get("/formats")
+def formats(
+    url: str = Query(..., description="YouTube video URL"),
+    _auth=Depends(require_api_key),
+):
+    """Sirf formats — jab poora metadata (description, tags, waghera)
+    nahi chahiye, bas quick format list chahiye, tab ye lighter hai."""
+    try:
+        data = _extract(url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
+
+    audio, video, combined = _split_formats(data.get("formats", []))
+    return {
+        "status":           True,
+        "videoId":          data.get("id"),
+        "audio_formats":    audio,
+        "video_formats":    video,
+        "combined_formats": combined,
+    }
+
+
+@app.get("/best")
+def best(
+    url: str = Query(..., description="YouTube video URL"),
+    height: int | None = Query(None, description="Is height ke barabar ya sabse kareeb video chuno (default: sabse best)"),
+    ext: str | None = Query(None, description="Preferred container, e.g. mp4"),
+    _auth=Depends(require_api_key),
+):
+    """Ek-shot 'best pick' — bina poori list chhaan-be-chhaan kiye
+    seedha ek best audio aur ek best (ya requested height ke kareeb)
+    video format de deta hai. Bots ke liye sabse aasan route."""
+    try:
+        data = _extract(url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
+
+    audio, video, combined = _split_formats(data.get("formats", []))
+    audio = _filter_formats(audio, ext=ext) or audio
+    video_pool = _filter_formats(video, ext=ext) or video
+
+    if not video_pool and combined:
+        video_pool = combined
+
+    chosen_video = None
+    if video_pool:
+        if height:
+            chosen_video = min(video_pool, key=lambda f: abs((f["height"] or 0) - height))
+        else:
+            chosen_video = video_pool[0]
+
+    chosen_audio = audio[0] if audio else (combined[0] if combined else None)
+
+    if not chosen_video and not chosen_audio:
+        raise HTTPException(status_code=502, detail="No downloadable formats found")
+
+    return {
+        "status":  True,
+        "videoId": data.get("id"),
+        "title":   data.get("title"),
+        "audio":   chosen_audio,
+        "video":   chosen_video,
+    }
+
+
+@app.get("/subtitles")
+def subtitles(
+    url: str = Query(..., description="YouTube video URL"),
+    auto: bool = Query(False, description="True = auto-generated captions, False = uploader ki apni subtitles"),
+    _auth=Depends(require_api_key),
+):
+    try:
+        data = _extract(url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
+
+    subs = _extract_subs(data, auto=auto)
+    return {
+        "status":         True,
+        "videoId":        data.get("id"),
+        "auto_generated": auto,
+        "languages":      list(subs.keys()),
+        "subtitles":      subs,
+    }
+
+
+@app.get("/playlist")
+def playlist(
+    url: str = Query(..., description="YouTube playlist URL"),
+    limit: int = Query(50, ge=1, le=200, description="Kitni videos tak fetch karni hain"),
+    _auth=Depends(require_api_key),
+):
+    """Playlist ke andar ki videos ki halki list (extract_flat — har
+    video ka poora format info nahi laata, isliye fast hai). Har entry
+    ki poori detail chahiye ho to us video ka url /info pe bhejo."""
+    try:
+        data = _extract(url, extra_opts={"noplaylist": False, "extract_flat": "in_playlist", "playlistend": limit})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
+
+    entries = data.get("entries") or []
+    videos = [
+        {
+            "videoId":   e.get("id"),
+            "title":     e.get("title"),
+            "url":       e.get("url") or (f"https://youtu.be/{e.get('id')}" if e.get("id") else None),
+            "duration":  e.get("duration"),
+            "uploader":  e.get("uploader") or e.get("channel"),
+            "thumbnail": (e.get("thumbnails") or [{}])[-1].get("url"),
+        }
+        for e in entries
+    ]
+
+    return {
+        "status":        True,
+        "playlistId":    data.get("id"),
+        "playlistTitle": data.get("title"),
+        "video_count":   len(videos),
+        "videos":        videos,
+    }
+
+
+@app.get("/search")
+def search(
+    q: str = Query(..., description="Search query"),
+    limit: int = Query(10, ge=1, le=50, description="Kitne results chahiye"),
+    _auth=Depends(require_api_key),
+):
+    """YouTube search — ytsearch{n}:query use karta hai. Result halka
+    hai (extract_flat), poori detail ke liye us video ka url /info pe
+    bhej do."""
+    query = f"ytsearch{limit}:{q}"
+    try:
+        data = _extract(query, extra_opts={"noplaylist": False, "extract_flat": "in_playlist"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp search failed: {e}")
+
+    entries = data.get("entries") or []
+    results = [
+        {
+            "videoId":   e.get("id"),
+            "title":     e.get("title"),
+            "url":       e.get("url") or (f"https://youtu.be/{e.get('id')}" if e.get("id") else None),
+            "duration":  e.get("duration"),
+            "uploader":  e.get("uploader") or e.get("channel"),
+            "thumbnail": (e.get("thumbnails") or [{}])[-1].get("url"),
+        }
+        for e in entries
+    ]
+
+    return {"status": True, "query": q, "result_count": len(results), "results": results}
+
+
 @app.get("/debug")
-def debug(url: str = Query(..., description="YouTube video URL")):
+def debug(
+    url: str = Query(..., description="YouTube video URL"),
+    _auth=Depends(require_api_key),
+):
     """yt-dlp ka poora verbose log return karta hai, cookie pool ke sath
     try karte hue. Dekho: 'Retrieved a gvs PO Token', 'JS runtimes: deno',
     aur agar cookies use hui to unka path bhi dikhega."""
@@ -303,7 +695,8 @@ def debug(url: str = Query(..., description="YouTube video URL")):
 @app.get("/cookies/upload")
 def upload_cookies_form():
     """Mobile browser se seedha cookies.txt upload karne ka simple page —
-    terminal/curl ki zaroorat nahi. Isi URL ko phone ke browser me kholo."""
+    terminal/curl ki zaroorat nahi. Isi URL ko phone ke browser me kholo.
+    Agar API_KEY set hai to form me wo bhi daalni hogi."""
     from fastapi.responses import HTMLResponse
     html = """
     <!DOCTYPE html>
@@ -315,7 +708,7 @@ def upload_cookies_form():
         body { font-family: sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
         h2 { margin-bottom: 4px; }
         p { color: #555; }
-        input[type=file] { margin: 16px 0; display: block; }
+        input[type=text], input[type=file] { margin: 10px 0; display: block; width: 100%; box-sizing: border-box; padding: 8px; }
         button { background: #16a34a; color: white; border: none; padding: 12px 20px;
                  border-radius: 6px; font-size: 16px; }
         #result { margin-top: 16px; padding: 12px; border-radius: 6px; display: none; white-space: pre-wrap; word-break: break-all; }
@@ -327,6 +720,7 @@ def upload_cookies_form():
     <body>
       <h2>Cookies Upload</h2>
       <p>Apni exported <b>cookies.txt</b> file yahan choose karke Upload dabao.</p>
+      <input type="text" id="apiKeyInput" placeholder="API key (agar set hai to)">
       <input type="file" id="fileInput" accept=".txt">
       <button onclick="upload()">Upload</button>
       <div id="result"></div>
@@ -338,6 +732,7 @@ def upload_cookies_form():
       <script>
         async function upload() {
           const input = document.getElementById('fileInput');
+          const apikey = document.getElementById('apiKeyInput').value.trim();
           const resultBox = document.getElementById('result');
           const envBox = document.getElementById('envBox');
           if (!input.files.length) { alert('Pehle file choose karo'); return; }
@@ -348,7 +743,8 @@ def upload_cookies_form():
           resultBox.textContent = 'Uploading...';
           envBox.style.display = 'none';
           try {
-            const res = await fetch('/cookies/upload', { method: 'POST', body: form });
+            const qs = apikey ? ('?apikey=' + encodeURIComponent(apikey)) : '';
+            const res = await fetch('/cookies/upload' + qs, { method: 'POST', body: form });
             const data = await res.json();
             if (res.ok) {
               resultBox.style.background = '#dcfce7';
@@ -378,7 +774,7 @@ def upload_cookies_form():
 
 
 @app.post("/cookies/upload")
-async def upload_cookies(file: UploadFile = File(...)):
+async def upload_cookies(file: UploadFile = File(...), _auth=Depends(require_api_key)):
     """Naya cookies.txt (Netscape format, browser se 'Get cookies.txt
     LOCALLY' extension se export kiya hua) pool me add karta hai. Isi
     URL pe file bhej do — turant pool me shaamil ho jaayegi.
@@ -412,7 +808,7 @@ async def upload_cookies(file: UploadFile = File(...)):
 
 
 @app.get("/cookies/status")
-def cookies_status():
+def cookies_status(_auth=Depends(require_api_key)):
     """Pool ke har cookie-set ko ek chhote test-video pe try karta hai
     aur bata deta hai kaun zinda hai, kaun expire ho chuka. Regularly
     check karte raho — jab sab 'valid: false' ho jaayein, tabhi nayi
@@ -432,30 +828,6 @@ def cookies_status():
         results.append({"file": os.path.basename(path), "valid": valid, "error": err})
 
     return {"pool_size": len(results), "cookies": results}
-
-
-@app.get("/info")
-def info(url: str = Query(..., description="YouTube video URL")):
-    try:
-        data = _extract(url)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
-
-    audio_formats, video_formats = _split_formats(data.get("formats", []))
-
-    if not audio_formats and not video_formats:
-        raise HTTPException(status_code=502, detail="No downloadable formats found")
-
-    return {
-        "status":         True,
-        "videoId":        data.get("id"),
-        "title":          data.get("title"),
-        "thumbnail":      data.get("thumbnail"),
-        "duration":       data.get("duration"),
-        "uploader":       data.get("uploader"),
-        "audio_formats":  audio_formats,
-        "video_formats":  video_formats,
-    }
 
 
 @app.get("/health")
