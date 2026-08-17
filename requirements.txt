@@ -4,3 +4,4 @@ python-multipart
 requests
 yt-dlp[default]
 bgutil-ytdlp-pot-provider
+yt-dlp-invidious
