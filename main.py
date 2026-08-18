@@ -69,11 +69,28 @@ def require_api_key(
         raise HTTPException(status_code=401, detail="Invalid or missing API key. Pass ?apikey=... or X-API-Key header.")
 
 
-# bgutil-ytdlp-pot-provider ka HTTP server URL (optional). Ye cookies
-# nahi maangta, isliye rakhna free hai — lekin note karo ki maintainer
-# khud keh chuke hain ki PO token ab zyada cases me bot-check bypass
-# nahi karta. Isliye ye sirf "helps sometimes" hai, primary fix nahi.
+# bgutil-ytdlp-pot-provider — PO (proof-of-origin) token generate karta
+# hai bina cookies/login ke. Do modes hain:
+#   • SCRIPT MODE (default, zero-config): render.yaml build ke dauraan
+#     iski repo clone hoti hai aur Deno se dependencies install hoti
+#     hain. Har request pe yt-dlp khud hi ek chhota Deno script chalata
+#     hai jo token generate karta hai — koi alag se chalti hui service
+#     nahi chahiye. Agar cloned repo mil jaaye to ye automatically use
+#     ho jaata hai, kuch set karne ki zaroorat nahi.
+#   • HTTP MODE (optional, extra): agar tumne kahin alag se bgutil ka
+#     HTTP server host kiya hai (jaise doosri free service pe), uska
+#     URL BGUTIL_PROVIDER_URL env var me daal do. Dono available hon
+#     to HTTP mode ko priority milti hai (yt-dlp ka apna default).
+#
+# ⚠️ Caution (khud maintainer keh chuke hain): PO token dena bot-check
+# bypass hone ki GUARANTEE nahi deta, lekin traffic ko zyada
+# "legitimate" dikhne me madad karta hai — free hone ki wajah se add
+# karne me koi nuksaan nahi.
 BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
+BGUTIL_SCRIPT_HOME = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "bgutil-ytdlp-pot-provider", "server"
+)
+BGUTIL_SCRIPT_AVAILABLE = os.path.isdir(BGUTIL_SCRIPT_HOME)
 
 AUTH_ERROR_MARKERS = (
     "sign in to confirm",
@@ -89,6 +106,12 @@ def _is_auth_error(exc: Exception) -> bool:
 
 
 def _base_ydl_opts(logger=None, verbose: bool = False) -> dict:
+    pot_args = {}
+    if BGUTIL_PROVIDER_URL:
+        pot_args["youtubepot-bgutilhttp"] = {"base_url": [BGUTIL_PROVIDER_URL]}
+    if BGUTIL_SCRIPT_AVAILABLE:
+        pot_args["youtubepot-bgutilscript"] = {"server_home": [BGUTIL_SCRIPT_HOME]}
+
     opts = {
         "quiet": not verbose,
         "no_warnings": not verbose,
@@ -96,7 +119,7 @@ def _base_ydl_opts(logger=None, verbose: bool = False) -> dict:
         "noplaylist": True,
         "extractor_args": {
             "youtube": {"player_client": ["android", "ios", "tv", "mweb", "web"]},
-            **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
+            **pot_args,
         },
     }
     if verbose:
@@ -172,18 +195,12 @@ def _race_get(bases: list[str], path: str, params: dict | None = None, timeout: 
 FALLBACK_PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.leptons.xyz",
-    "https://pipedapi.nosebs.ru",
     "https://pipedapi-libre.kavin.rocks",
-    "https://piped-api.privacy.com.de",
     "https://pipedapi.adminforge.de",
-    "https://api.piped.yt",
     "https://pipedapi.drgns.space",
-    "https://pipedapi.owo.si",
     "https://pipedapi.ducks.party",
-    "https://piped-api.codespace.cz",
     "https://pipedapi.reallyaweso.me",
     "https://api.piped.private.coffee",
-    "https://pipedapi.darkness.services",
     "https://pipedapi.orangenet.cc",
 ]
 
@@ -248,10 +265,10 @@ FALLBACK_INVIDIOUS_INSTANCES = [
     "https://invidious.nerdvpn.de",
     "https://iv.ggtyler.dev",
     "https://inv.nadeko.net",
-    "https://invidious.jing.rocks",
     "https://inv.tux.pizza",
     "https://invidious.privacyredirect.com",
     "https://invidious.protokolla.fi",
+    "https://inv.thepixora.com",
 ]
 
 _invidious_instances_cache = {"ts": 0.0, "list": []}
@@ -992,6 +1009,8 @@ def debug(
         "bgutil_provider_url_configured": bool(BGUTIL_PROVIDER_URL),
         "bgutil_provider_url": BGUTIL_PROVIDER_URL or None,
         "bgutil_warm_up_succeeded": warm_up_ok,
+        "bgutil_script_mode_available": BGUTIL_SCRIPT_AVAILABLE,
+        "bgutil_script_home": BGUTIL_SCRIPT_HOME if BGUTIL_SCRIPT_AVAILABLE else None,
         "ytdlp_extracted_ok": ytdlp_ok,
         "ytdlp_format_count": ytdlp_format_count,
         "ytdlp_error": ytdlp_error,
