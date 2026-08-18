@@ -1,9 +1,24 @@
 """
 Render pe deploy karne wala YouTube info API.
 Kaam: yt-dlp se video/playlist/search ka info nikalna aur HAR tarah ke
-formats (audio-only, video-only, combined/muxed — a-to-z sab) ki list
-with direct CDN url return karna, saath me subtitles, thumbnails,
-chapters, playlist aur search bhi.
+formats (audio-only, video-only, combined/muxed) ki list with direct
+CDN url return karna, saath me subtitles, thumbnails, chapters,
+playlist aur search bhi.
+
+⚠️ COOKIES SYSTEM HATA DIYA GAYA HAI. Wajah: Render free tier ka
+filesystem ephemeral hai (service so jaate hi disk wipe), isliye
+"self-refreshing" cookies bhi practically 1-2 requests ke baad hi
+purani ho jaati thi aur baar-baar manual re-upload ki zaroorat padti
+thi — jo ki maintain karna possible nahi tha.
+
+Iski jagah ab: agar YouTube seedha block kare ("Sign in to confirm
+you're not a bot"), API automatically PIPED (piped.video jaisa free,
+open-source YouTube-proxy network — koi login/cookies nahi chahiye)
+pe fallback kar deta hai. Ye guarantee nahi hai (Piped instances khud
+kabhi down/slow ho sakti hain, aur unki quality yt-dlp jitni high na
+ho — usually 1080p tak), lekin bina kisi login/maintenance ke chalta
+rehta hai, jo is use-case ke liye zyada practical hai.
+
 Downloading, transcoding, muxing — sab kuch bot side pe hota hai,
 ye API sirf "info + urls" deta hai.
 
@@ -17,17 +32,16 @@ Render pe deploy:
     Start Command : uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Depends, Header
+from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-import base64
 import os
-import requests
+import re
 import time
+import requests
 import yt_dlp
 
-app = FastAPI(title="ytinfo-api", version="2.0")
+app = FastAPI(title="ytinfo-api", version="3.0")
 
-# Browser / webapp se seedha call karna ho to CORS khula rakha hai.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,12 +53,7 @@ app.add_middleware(
 # Render dashboard → Environment → API_KEY set karo (koi bhi random
 # lamba string). Uske baad har request me ?apikey=... ya X-API-Key
 # header dena zaroori hoga. Agar API_KEY set hi na karo to protection
-# off rehta hai (jaisa pehle tha) — set karne ki strongly salaah hai
-# warna koi bhi tumhari API free me use kar sakta hai.
-#
-# NOTE: pehle ye function bana hua tha lekin kisi bhi route pe laga
-# hua nahi tha (bug) — ab har data-returning route pe Depends() laga
-# diya gaya hai, taaki API_KEY set karne ka matlab ho.
+# off rehta hai.
 API_KEY = os.environ.get("API_KEY", "").strip()
 
 
@@ -58,34 +67,11 @@ def require_api_key(
         raise HTTPException(status_code=401, detail="Invalid or missing API key. Pass ?apikey=... or X-API-Key header.")
 
 
-# bgutil-ytdlp-pot-provider ka HTTP server URL — Render dashboard me
-# "Environment" tab se BGUTIL_PROVIDER_URL naam ka env var set karo
-# (e.g. https://bgutil-pot-provider-xxxx.onrender.com). Isse PO token
-# milta hai jo "web" client ko full quality formats dene deta hai.
+# bgutil-ytdlp-pot-provider ka HTTP server URL (optional). Ye cookies
+# nahi maangta, isliye rakhna free hai — lekin note karo ki maintainer
+# khud keh chuke hain ki PO token ab zyada cases me bot-check bypass
+# nahi karta. Isliye ye sirf "helps sometimes" hai, primary fix nahi.
 BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
-
-# ══════════════════════════════════════════════════════════════════════
-#   COOKIE POOL — auto-rotating cookies system
-#   ─────────────────────────────────────────────────────────────────
-#   YouTube kabhi-kabhi "Sign in to confirm you're not a bot" degi
-#   (Render jaise datacenter IPs ko flag karta hai). Iska ek hi real
-#   fix hai: real browser session ki cookies. Poora automatic login
-#   possible nahi hai (Google khud bot-login block karta hai), lekin
-#   is se aage sab automatic hai:
-#     • Env vars (COOKIES_1, COOKIES_2, ...) ya /cookies/upload se
-#       daali gayi cookies.txt files ek "pool" banati hain
-#     • Har extraction attempt pool ke har cookie-set ko baari-baari
-#       try karta hai jab tak ek kaam na kare
-#     • Jo cookie-set "Sign in to confirm"/LOGIN_REQUIRED de, use us
-#       request ke liye skip karke agli try karta hai — matlab jab tak
-#       pool me EK BHI valid cookie-set hai, downloads chalte rahenge
-#     • /cookies/status se dekh sakte ho kaunsi cookies zinda hain
-#     • Jab sab expire ho jaayein, /cookies/upload se nayi daal do
-#       (browser se "Get cookies.txt LOCALLY" extension se export karo)
-# ══════════════════════════════════════════════════════════════════════
-
-COOKIE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies")
-os.makedirs(COOKIE_DIR, exist_ok=True)
 
 AUTH_ERROR_MARKERS = (
     "sign in to confirm",
@@ -100,46 +86,6 @@ def _is_auth_error(exc: Exception) -> bool:
     return any(m in msg for m in AUTH_ERROR_MARKERS)
 
 
-def _load_env_cookie_pool():
-    """COOKIES_1, COOKIES_2, ... env vars (base64-encoded cookies.txt
-    content) ko disk pe likhta hai — LEKIN SIRF agar file already exist
-    nahi karti. Ye zaroori hai: yt-dlp har request ke baad is file me
-    refreshed session tokens WAPAS likh deta hai (--cookies FILE load
-    bhi karta hai aur save bhi usi file me). Agar hum har restart pe
-    env var se dobara overwrite kar dete, to wo refresh hamesha udd
-    jaata — isi wajah se cookies 'jaldi expire' hoti dikh rahi thi.
-    Ab sirf pehli baar (fresh deploy ke baad) seed hoga, uske baad
-    file khud-ba-khud apne aap fresh rehti hai."""
-    i = 1
-    while True:
-        val = os.environ.get(f"COOKIES_{i}")
-        if not val:
-            break
-        path = os.path.join(COOKIE_DIR, f"env_{i}.txt")
-        if not os.path.exists(path):
-            try:
-                content = base64.b64decode(val).decode("utf-8")
-                with open(path, "w") as f:
-                    f.write(content)
-            except Exception:
-                pass
-        i += 1
-
-
-_load_env_cookie_pool()
-
-
-def _cookie_pool_paths() -> list[str]:
-    """Available cookie files ki list (env-seeded + upload se aayi hui)."""
-    if not os.path.isdir(COOKIE_DIR):
-        return []
-    return sorted(
-        os.path.join(COOKIE_DIR, f)
-        for f in os.listdir(COOKIE_DIR)
-        if f.endswith(".txt")
-    )
-
-
 def _base_ydl_opts(logger=None, verbose: bool = False) -> dict:
     opts = {
         "quiet": not verbose,
@@ -147,7 +93,7 @@ def _base_ydl_opts(logger=None, verbose: bool = False) -> dict:
         "skip_download": True,
         "noplaylist": True,
         "extractor_args": {
-            "youtube": {"player_client": ["tv", "mweb", "web"]},
+            "youtube": {"player_client": ["android", "ios", "tv", "mweb", "web"]},
             **({"youtubepot-bgutilhttp": {"base_url": [BGUTIL_PROVIDER_URL]}} if BGUTIL_PROVIDER_URL else {}),
         },
     }
@@ -158,17 +104,12 @@ def _base_ydl_opts(logger=None, verbose: bool = False) -> dict:
     return opts
 
 
-def _warm_bgutil_provider(retries: int = 3, delay_seconds: int = 5) -> bool:
-    """Render free tier pe bgutil-pot-provider bhi inactivity ke baad so
-    jaata hai, aur kabhi-kabhi ek hi ping try karne se cold-start ke beech
-    502 mil jaata hai. Isliye ab ek nahi, teen attempts karte hain — jab
-    tak 200 OK na mile ya retries khatam na ho jaayein. Returns True/False
-    taaki /debug me confirm ho sake provider actually ready tha ya nahi."""
+def _warm_bgutil_provider(retries: int = 2, delay_seconds: int = 4) -> bool:
     if not BGUTIL_PROVIDER_URL:
         return False
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(f"{BGUTIL_PROVIDER_URL}/ping", timeout=60)
+            r = requests.get(f"{BGUTIL_PROVIDER_URL}/ping", timeout=30)
             if r.status_code == 200:
                 return True
         except Exception:
@@ -178,36 +119,394 @@ def _warm_bgutil_provider(retries: int = 3, delay_seconds: int = 5) -> bool:
     return False
 
 
-def _extract(url: str, extra_opts: dict | None = None) -> dict:
-    """Cookie pool ke har set ko baari-baari try karta hai (aur ek attempt
-    bina cookies ke bhi, kyunki kabhi-kabhi wo bhi chal jaata hai). Sirf
-    auth-error (LOGIN_REQUIRED) pe hi next cookie try karta hai — koi aur
-    error ho to turant raise kar deta hai, chhupata nahi.
+# ══════════════════════════════════════════════════════════════════════
+#   PIPED FALLBACK — cookies ke bina bhi kaam chalane ka tareeka
+#   ─────────────────────────────────────────────────────────────────
+#   Piped (github.com/TeamPiped/Piped) ek open-source, federated
+#   YouTube-proxy network hai — dozens of free public instances jo khud
+#   server-side pe stream URLs resolve karke dete hain, kisi login/
+#   cookies ki zaroorat nahi. Jab yt-dlp "Sign in to confirm you're not
+#   a bot" de, hum automatically inhi instances me se ek try karte hain.
+#   Instance list dynamically fetch hoti hai (community ka suggestion
+#   yahi hai, kyunki instances aate-jaate rehte hain) — fetch fail ho
+#   to hardcoded fallback list use hoti hai.
+# ══════════════════════════════════════════════════════════════════════
 
-    extra_opts se yt-dlp options override/add kiye ja sakte hain — jaise
-    playlist extraction ke liye noplaylist:False, ya search ke liye
-    extract_flat, jisse ek hi function playlist/search/single-video sab
-    ke liye reuse ho sake."""
-    _warm_bgutil_provider()
-    cookie_paths = _cookie_pool_paths()
-    attempts = cookie_paths + [None]  # None = cookies ke bina, last resort
+FALLBACK_PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.nosebs.ru",
+    "https://pipedapi-libre.kavin.rocks",
+    "https://piped-api.privacy.com.de",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.yt",
+    "https://pipedapi.drgns.space",
+    "https://pipedapi.owo.si",
+    "https://pipedapi.ducks.party",
+    "https://piped-api.codespace.cz",
+    "https://pipedapi.reallyaweso.me",
+    "https://api.piped.private.coffee",
+    "https://pipedapi.darkness.services",
+    "https://pipedapi.orangenet.cc",
+]
 
-    last_error = None
-    for cookiefile in attempts:
-        opts = _base_ydl_opts()
-        if extra_opts:
-            opts.update(extra_opts)
-        if cookiefile:
-            opts["cookiefile"] = cookiefile
+_piped_instances_cache = {"ts": 0.0, "list": []}
+
+
+def _get_piped_instances() -> list[str]:
+    """Live instance list ko 1 ghante tak cache karta hai. Do alag
+    sources try karta hai (instances-API pehle, phir docs repo ki
+    markdown list) kyunki dono kabhi-kabhi down ho jaate hain — ek
+    fail ho to doosra kaam aata hai. Dono fail ho to hardcoded list
+    (jo abhi ke known-active instances se banayi gayi hai) use hoti hai."""
+    now = time.time()
+    if _piped_instances_cache["list"] and (now - _piped_instances_cache["ts"]) < 3600:
+        return _piped_instances_cache["list"]
+
+    fresh = []
+    try:
+        r = requests.get("https://piped-instances.kavin.rocks/", timeout=6)
+        if r.status_code == 200:
+            fresh = [i.get("api_url") for i in r.json() if i.get("api_url")]
+    except Exception:
+        pass
+
+    if not fresh:
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
+            r = requests.get(
+                "https://raw.githubusercontent.com/TeamPiped/documentation/main/content/docs/public-instances/index.md",
+                timeout=6,
+            )
+            if r.status_code == 200:
+                fresh = re.findall(r"\|\s*(https://\S+?)\s*\|", r.text)
+        except Exception:
+            pass
+
+    instances = (fresh + [i for i in FALLBACK_PIPED_INSTANCES if i not in fresh]) if fresh else list(FALLBACK_PIPED_INSTANCES)
+    _piped_instances_cache["ts"] = now
+    _piped_instances_cache["list"] = instances
+    return instances
+
+
+def _piped_get(path: str, params: dict | None = None, max_tries: int = 10):
+    """Path ko baari-baari kai Piped instances pe try karta hai jab tak
+    ek jawab na de. Har instance apne aap me poori tarah independent
+    server hai, isliye ek down/slow/DNS-fail ho to doosri try ho jaati
+    hai. Timeout jaan-boojh kar chhota (8s) rakha hai taaki dead
+    instances pe zyada time waste na ho — 10 instances tak try karne
+    par bhi worst case ~80s hi lagega."""
+    last_err = None
+    for base in _get_piped_instances()[:max_tries]:
+        try:
+            r = requests.get(base.rstrip("/") + path, params=params, timeout=8)
+            if r.status_code != 200:
+                last_err = f"{base} -> HTTP {r.status_code}"
+                continue
+            data = r.json()
+            if isinstance(data, dict) and data.get("error"):
+                last_err = f"{base} -> {data.get('message') or data.get('error')}"
+                continue
+            return data, base
         except Exception as e:
-            last_error = e
-            if _is_auth_error(e):
-                continue  # is cookie-set ka time khatam, agla try karo
-            raise  # koi aur tarah ka error — foran surface karo, chhupao mat
-    raise last_error
+            last_err = f"{base} -> {e}"
+            continue
+    raise RuntimeError(f"Sabhi Piped instances fail ho gaye. Last error: {last_err}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   INVIDIOUS FALLBACK — Piped bhi fail ho jaaye to doosra jaal
+#   ─────────────────────────────────────────────────────────────────
+#   Invidious bhi Piped jaisa hi ek open, federated YouTube-proxy
+#   network hai, lekin ek bilkul alag codebase/community ke sath.
+#   Dono networks ka ek saath down hona kaafi rare hai — isliye ye
+#   dusra independent safety net hai.
+# ══════════════════════════════════════════════════════════════════════
+
+FALLBACK_INVIDIOUS_INSTANCES = [
+    "https://yewtu.be",
+    "https://invidious.nerdvpn.de",
+    "https://iv.ggtyler.dev",
+    "https://inv.nadeko.net",
+    "https://invidious.jing.rocks",
+    "https://inv.tux.pizza",
+    "https://invidious.privacyredirect.com",
+    "https://invidious.protokolla.fi",
+]
+
+_invidious_instances_cache = {"ts": 0.0, "list": []}
+
+
+def _get_invidious_instances() -> list[str]:
+    now = time.time()
+    if _invidious_instances_cache["list"] and (now - _invidious_instances_cache["ts"]) < 3600:
+        return _invidious_instances_cache["list"]
+
+    instances = list(FALLBACK_INVIDIOUS_INSTANCES)
+    try:
+        r = requests.get("https://api.invidious.io/instances.json?sort_by=type,health", timeout=6)
+        if r.status_code == 200:
+            fresh = [
+                entry[1].get("uri")
+                for entry in r.json()
+                if isinstance(entry, list) and len(entry) > 1 and entry[1].get("type") == "https" and entry[1].get("api") and entry[1].get("uri")
+            ]
+            if fresh:
+                instances = fresh + [i for i in FALLBACK_INVIDIOUS_INSTANCES if i not in fresh]
+    except Exception:
+        pass
+
+    _invidious_instances_cache["ts"] = now
+    _invidious_instances_cache["list"] = instances
+    return instances
+
+
+def _invidious_get(path: str, params: dict | None = None, max_tries: int = 8):
+    last_err = None
+    for base in _get_invidious_instances()[:max_tries]:
+        try:
+            r = requests.get(base.rstrip("/") + path, params=params, timeout=8)
+            if r.status_code != 200:
+                last_err = f"{base} -> HTTP {r.status_code}"
+                continue
+            data = r.json()
+            if isinstance(data, dict) and data.get("error"):
+                last_err = f"{base} -> {data.get('error')}"
+                continue
+            return data, base
+        except Exception as e:
+            last_err = f"{base} -> {e}"
+            continue
+    raise RuntimeError(f"Sabhi Invidious instances fail ho gaye. Last error: {last_err}")
+
+
+YOUTUBE_ID_RE = re.compile(r"(?:v=|/videos/|embed/|youtu\.be/|shorts/|live/)([0-9A-Za-z_-]{11})")
+PLAYLIST_ID_RE = re.compile(r"[?&]list=([0-9A-Za-z_-]+)")
+
+
+def _video_id_from_url(url: str) -> str | None:
+    if re.fullmatch(r"[0-9A-Za-z_-]{11}", url):
+        return url
+    m = YOUTUBE_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _playlist_id_from_url(url: str) -> str | None:
+    m = PLAYLIST_ID_RE.search(url)
+    if m:
+        return m.group(1)
+    return url if url.startswith(("PL", "UU", "LL", "FL")) else None
+
+
+def _kbps(bitrate) -> float | None:
+    if not bitrate:
+        return None
+    return round(bitrate / 1000, 1)
+
+
+def _piped_normalize(pj: dict, video_id: str) -> dict:
+    """Piped ke /streams response ko yt-dlp jaisi shape me convert
+    karta hai, taaki neeche wala saara format/response-building code
+    dono sources ke liye same rahe."""
+    formats = []
+    for i, a in enumerate(pj.get("audioStreams") or []):
+        formats.append({
+            "format_id":  f"piped-a{i}",
+            "ext":        (a.get("format") or "m4a").lower(),
+            "acodec":     a.get("codec"),
+            "vcodec":     "none",
+            "abr":        _kbps(a.get("bitrate")),
+            "asr":        None,
+            "height":     None,
+            "width":      None,
+            "fps":        None,
+            "filesize":   None,
+            "url":        a.get("url"),
+            "format_note": a.get("quality"),
+            "protocol":   "https",
+            "language":   None,
+            "dynamic_range": None,
+            "audio_channels": None,
+            "is_live":    bool(pj.get("livestream")),
+        })
+    for i, v in enumerate(pj.get("videoStreams") or []):
+        video_only = v.get("videoOnly", True)
+        formats.append({
+            "format_id":  f"piped-v{i}",
+            "ext":        (v.get("format") or "mp4").lower(),
+            "acodec":     "none" if video_only else "unknown",
+            "vcodec":     v.get("codec") or "unknown",
+            "abr":        None if video_only else _kbps(v.get("bitrate")),
+            "asr":        None,
+            "height":     v.get("height"),
+            "width":      v.get("width"),
+            "fps":        v.get("fps"),
+            "filesize":   None,
+            "url":        v.get("url"),
+            "format_note": v.get("quality"),
+            "protocol":   "https",
+            "language":   None,
+            "dynamic_range": None,
+            "audio_channels": None,
+            "is_live":    bool(pj.get("livestream")),
+        })
+
+    subs, autosubs = {}, {}
+    for s in pj.get("subtitles") or []:
+        target = autosubs if s.get("autoGenerated") else subs
+        target.setdefault(s.get("code") or "und", []).append(
+            {"ext": "ttml", "name": s.get("name"), "url": s.get("url")}
+        )
+
+    return {
+        "id":              video_id,
+        "title":           pj.get("title"),
+        "description":     pj.get("description"),
+        "thumbnail":       pj.get("thumbnailUrl"),
+        "thumbnails":      [{"url": pj.get("thumbnailUrl"), "width": None, "height": None}] if pj.get("thumbnailUrl") else [],
+        "duration":        pj.get("duration"),
+        "duration_string": None,
+        "uploader":        pj.get("uploader"),
+        "uploader_id":     None,
+        "channel_url":     pj.get("uploaderUrl"),
+        "upload_date":     pj.get("uploadDate"),
+        "view_count":      pj.get("views"),
+        "like_count":      pj.get("likes"),
+        "comment_count":   None,
+        "categories":      None,
+        "tags":            None,
+        "is_live":         bool(pj.get("livestream")),
+        "was_live":        False,
+        "availability":    None,
+        "age_limit":       None,
+        "chapters":        [],
+        "formats":         formats,
+        "subtitles":       subs,
+        "automatic_captions": autosubs,
+        "_source":         "piped",
+    }
+
+
+def _invidious_normalize(v: dict, video_id: str) -> dict:
+    """Invidious ke /api/v1/videos response ko yt-dlp jaisi shape me
+    convert karta hai."""
+    formats = []
+    for f in v.get("adaptiveFormats") or []:
+        mime = f.get("type") or ""
+        is_audio = mime.startswith("audio/")
+        formats.append({
+            "format_id":  f"inv-{f.get('itag')}",
+            "ext":        f.get("container") or (mime.split("/")[1].split(";")[0] if "/" in mime else "mp4"),
+            "acodec":     f.get("encoding") if is_audio else "none",
+            "vcodec":     "none" if is_audio else (f.get("encoding") or "unknown"),
+            "abr":        _kbps(f.get("bitrate")) if is_audio else None,
+            "asr":        f.get("audioSampleRate"),
+            "height":     None if is_audio else f.get("height"),
+            "width":      None if is_audio else f.get("width"),
+            "fps":        None if is_audio else f.get("fps"),
+            "filesize":   None,
+            "url":        f.get("url"),
+            "format_note": f.get("qualityLabel") or f.get("audioQuality"),
+            "protocol":   "https",
+            "language":   None,
+            "dynamic_range": None,
+            "audio_channels": None,
+            "is_live":    bool(v.get("isLive")),
+        })
+    for f in v.get("formatStreams") or []:
+        formats.append({
+            "format_id":  f"inv-c{f.get('itag')}",
+            "ext":        f.get("container") or "mp4",
+            "acodec":     "aac",
+            "vcodec":     f.get("encoding") or "h264",
+            "abr":        None,
+            "asr":        None,
+            "height":     f.get("height"),
+            "width":      f.get("width"),
+            "fps":        f.get("fps"),
+            "filesize":   None,
+            "url":        f.get("url"),
+            "format_note": f.get("qualityLabel"),
+            "protocol":   "https",
+            "language":   None,
+            "dynamic_range": None,
+            "audio_channels": None,
+            "is_live":    bool(v.get("isLive")),
+        })
+
+    subs = {}
+    for c in v.get("captions") or []:
+        subs.setdefault(c.get("languageCode") or "und", []).append(
+            {"ext": "vtt", "name": c.get("label"), "url": c.get("url")}
+        )
+
+    thumbs = v.get("videoThumbnails") or []
+    return {
+        "id":              video_id,
+        "title":           v.get("title"),
+        "description":     v.get("description"),
+        "thumbnail":       thumbs[-1].get("url") if thumbs else None,
+        "thumbnails":      [{"url": t.get("url"), "width": t.get("width"), "height": t.get("height")} for t in thumbs],
+        "duration":        v.get("lengthSeconds"),
+        "duration_string": None,
+        "uploader":        v.get("author"),
+        "uploader_id":     v.get("authorId"),
+        "channel_url":     v.get("authorUrl"),
+        "upload_date":     None,
+        "view_count":      v.get("viewCount"),
+        "like_count":      v.get("likeCount"),
+        "comment_count":   None,
+        "categories":      None,
+        "tags":            v.get("keywords"),
+        "is_live":         bool(v.get("isLive")),
+        "was_live":        False,
+        "availability":    None,
+        "age_limit":       None,
+        "chapters":        [],
+        "formats":         formats,
+        "subtitles":       subs,
+        "automatic_captions": {},
+        "_source":         "invidious",
+    }
+
+
+def get_video_data(url: str) -> dict:
+    """Teen-level fallback chain:
+      1. yt-dlp (cookies ke bina — android/ios/tv/mweb/web clients)
+      2. Piped network (dozens of free public instances)
+      3. Invidious network (alag codebase/community, dusra safety net)
+    Teeno fail ho to hi error uthaata hai — matlab poori request tabhi
+    fail hogi jab dono independent proxy-networks EK SAATH down hon,
+    jo ki rare hai."""
+    _warm_bgutil_provider()
+    try:
+        with yt_dlp.YoutubeDL(_base_ydl_opts()) as ydl:
+            data = ydl.extract_info(url, download=False)
+        data["_source"] = "yt-dlp"
+        return data
+    except Exception as e:
+        if not _is_auth_error(e):
+            raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
+        ytdlp_err = e
+
+    video_id = _video_id_from_url(url)
+    if not video_id:
+        raise HTTPException(status_code=500, detail=f"yt-dlp ne bot-check pe roka ({ytdlp_err}) aur URL se video ID bhi nahi nikal paya, fallback nahi ho saka.")
+
+    piped_err = None
+    try:
+        pj, _inst = _piped_get(f"/streams/{video_id}")
+        return _piped_normalize(pj, video_id)
+    except Exception as pe:
+        piped_err = pe
+
+    try:
+        vj, _inst = _invidious_get(f"/api/v1/videos/{video_id}")
+        return _invidious_normalize(vj, video_id)
+    except Exception as ie:
+        raise HTTPException(
+            status_code=502,
+            detail=f"yt-dlp bot-check pe roka, aur Piped ({piped_err}) + Invidious ({ie}) dono fallback fail ho gaye.",
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -215,7 +514,6 @@ def _extract(url: str, extra_opts: dict | None = None) -> dict:
 # ══════════════════════════════════════════════════════════════════════
 
 def _human_size(num) -> str | None:
-    """Bytes ko readable string me convert karta hai (e.g. '4.7 MB')."""
     if not num:
         return None
     num = float(num)
@@ -227,8 +525,6 @@ def _human_size(num) -> str | None:
 
 
 def _quality_label(f: dict) -> str:
-    """Insaan-padhne-layak quality label banata hai — jaise '1080p60',
-    '720p', '160kbps' — yt-dlp ke raw format_note se zyada consistent."""
     height = f.get("height")
     fps = f.get("fps")
     abr = f.get("abr")
@@ -251,9 +547,6 @@ def _quality_label(f: dict) -> str:
 
 
 def _format_entry(f: dict) -> dict:
-    """Ek raw yt-dlp format dict ko poori detail wale clean dict me
-    convert karta hai — audio, video, ya combined, sabke liye same
-    shape (jo fields kisi format pe apply nahi hoti wo None rehti hain)."""
     acodec = f.get("acodec")
     vcodec = f.get("vcodec")
     has_audio = acodec not in (None, "none")
@@ -267,7 +560,7 @@ def _format_entry(f: dict) -> dict:
     elif has_video:
         kind = "video"
     else:
-        kind = "other"  # storyboards / mhtml preview strips waghera
+        kind = "other"
 
     return {
         "itag":              f.get("format_id"),
@@ -297,17 +590,6 @@ def _format_entry(f: dict) -> dict:
 
 
 def _split_formats(raw_formats: list) -> tuple[list, list, list]:
-    """Raw yt-dlp formats ko teen categories me baantata hai:
-      • audio  → audio-only streams (koi video nahi)
-      • video  → video-only streams (koi audio nahi)
-      • combined → ek hi stream me audio+video dono (progressive/muxed,
-        jaise purana 360p mp4, ya live streams)
-    Pehle combined skip ho jaata tha; ab A-to-Z coverage ke liye teeno
-    return kiye jaate hain taaki bot jo bhi chahe use kar sake — agar
-    seedha ek hi file chahiye (bina ffmpeg mux ke) to combined kaam
-    aayega, agar best quality chahiye to audio-only + video-only mux
-    karna hi behtar rehta hai (YouTube high quality sirf adaptive
-    streams me deta hai)."""
     audio, video, combined = [], [], []
     for f in raw_formats:
         entry = _format_entry(f)
@@ -317,7 +599,6 @@ def _split_formats(raw_formats: list) -> tuple[list, list, list]:
             video.append(entry)
         elif entry["type"] == "combined":
             combined.append(entry)
-        # "other" (storyboards etc.) jaan-boojh kar drop kiya jaata hai
 
     audio.sort(key=lambda x: (x["abr_kbps"] or 0), reverse=True)
     video.sort(key=lambda x: (x["height"] or 0, x["fps"] or 0), reverse=True)
@@ -332,8 +613,6 @@ def _filter_formats(
     max_height: int | None = None,
     min_abr: float | None = None,
 ) -> list:
-    """/info aur /best pe optional query filters lagane ke liye —
-    e.g. ?ext=mp4 ya ?min_height=720 se sirf matching formats milte hain."""
     out = formats
     if ext:
         wanted = {e.strip().lower() for e in ext.split(",") if e.strip()}
@@ -348,8 +627,6 @@ def _filter_formats(
 
 
 def _extract_subs(data: dict, auto: bool = False) -> dict:
-    """info dict se subtitles / auto-captions ko clean {lang: [entries]}
-    shape me nikalta hai."""
     src = data.get("automatic_captions") if auto else data.get("subtitles")
     src = src or {}
     return {
@@ -379,10 +656,6 @@ def _chapters(data: dict) -> list:
 
 
 class _LogCapture:
-    """yt-dlp ke saare debug/warning/error messages ko capture karta hai
-    taaki hum unhe HTTP response me dekh sakein (Render free tier pe
-    Shell/SSH access nahi hota, isliye Logs tab ke alawa kahin aur se
-    dekhna mushkil hai)."""
     def __init__(self):
         self.lines: list[str] = []
 
@@ -405,23 +678,20 @@ class _LogCapture:
 
 @app.get("/")
 def root():
-    """Chhota index — kaun se endpoints available hain."""
     return {
         "status": True,
         "name": "ytinfo-api",
-        "version": "2.0",
+        "version": "3.0",
+        "note": "Cookies system hata diya gaya hai — bot-block hone pe API khud Piped network pe fallback karta hai.",
         "endpoints": {
-            "GET /info":            "Single video ka poora info + audio/video/combined formats",
-            "GET /best":            "Ek video, ek audio format — quickest 'best pick' shortcut",
-            "GET /formats":         "Sirf format list (halka payload, metadata ke bina)",
-            "GET /subtitles":       "Available subtitle/caption languages + direct URLs",
-            "GET /playlist":        "Playlist ke andar ki videos ki list",
-            "GET /search":          "YouTube search results",
-            "GET /debug":           "Verbose extraction log (troubleshooting ke liye)",
-            "GET /cookies/status":  "Cookie pool me kaunsi cookies zinda hain",
-            "GET /cookies/upload":  "Mobile browser se cookies.txt upload karne ka form",
-            "POST /cookies/upload": "cookies.txt file upload (multipart/form-data)",
-            "GET /health":          "Health check",
+            "GET /info":      "Single video ka poora info + audio/video/combined formats",
+            "GET /best":      "Ek video, ek audio format — quickest 'best pick' shortcut",
+            "GET /formats":   "Sirf format list (halka payload, metadata ke bina)",
+            "GET /subtitles": "Available subtitle/caption languages + direct URLs",
+            "GET /playlist":  "Playlist ke andar ki videos ki list",
+            "GET /search":    "YouTube search results",
+            "GET /debug":     "yt-dlp aur Piped fallback dono ka status (troubleshooting)",
+            "GET /health":    "Health check",
         },
     }
 
@@ -430,17 +700,14 @@ def root():
 def info(
     url: str = Query(..., description="YouTube video URL"),
     ext: str | None = Query(None, description="Comma-separated container filter, e.g. mp4,webm"),
-    min_height: int | None = Query(None, description="Video formats ko is height se kam skip kar do"),
-    max_height: int | None = Query(None, description="Video formats ko is height se zyada skip kar do"),
-    min_abr: float | None = Query(None, description="Audio formats ko is bitrate (kbps) se kam skip kar do"),
-    include_subs: bool = Query(False, description="Response me subtitles + auto-captions bhi jodo"),
-    include_chapters: bool = Query(True, description="Response me chapters jodo (agar available hon)"),
+    min_height: int | None = Query(None),
+    max_height: int | None = Query(None),
+    min_abr: float | None = Query(None),
+    include_subs: bool = Query(False),
+    include_chapters: bool = Query(True),
     _auth=Depends(require_api_key),
 ):
-    try:
-        data = _extract(url)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
+    data = get_video_data(url)
 
     audio, video, combined = _split_formats(data.get("formats", []))
     audio = _filter_formats(audio, ext=ext, min_abr=min_abr)
@@ -455,6 +722,7 @@ def info(
 
     result = {
         "status":            True,
+        "source":            data.get("_source"),
         "videoId":           data.get("id"),
         "title":             data.get("title"),
         "description":       data.get("description"),
@@ -478,10 +746,7 @@ def info(
         "audio_formats":     audio,
         "video_formats":     video,
         "combined_formats":  combined,
-        "best": {
-            "audio": best_audio,
-            "video": best_video,
-        },
+        "best": {"audio": best_audio, "video": best_video},
     }
     if include_chapters:
         result["chapters"] = _chapters(data)
@@ -497,16 +762,11 @@ def formats(
     url: str = Query(..., description="YouTube video URL"),
     _auth=Depends(require_api_key),
 ):
-    """Sirf formats — jab poora metadata (description, tags, waghera)
-    nahi chahiye, bas quick format list chahiye, tab ye lighter hai."""
-    try:
-        data = _extract(url)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
-
+    data = get_video_data(url)
     audio, video, combined = _split_formats(data.get("formats", []))
     return {
         "status":           True,
+        "source":           data.get("_source"),
         "videoId":          data.get("id"),
         "audio_formats":    audio,
         "video_formats":    video,
@@ -517,32 +777,20 @@ def formats(
 @app.get("/best")
 def best(
     url: str = Query(..., description="YouTube video URL"),
-    height: int | None = Query(None, description="Is height ke barabar ya sabse kareeb video chuno (default: sabse best)"),
-    ext: str | None = Query(None, description="Preferred container, e.g. mp4"),
+    height: int | None = Query(None, description="Is height ke barabar ya sabse kareeb video chuno"),
+    ext: str | None = Query(None),
     _auth=Depends(require_api_key),
 ):
-    """Ek-shot 'best pick' — bina poori list chhaan-be-chhaan kiye
-    seedha ek best audio aur ek best (ya requested height ke kareeb)
-    video format de deta hai. Bots ke liye sabse aasan route."""
-    try:
-        data = _extract(url)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
-
+    data = get_video_data(url)
     audio, video, combined = _split_formats(data.get("formats", []))
     audio = _filter_formats(audio, ext=ext) or audio
     video_pool = _filter_formats(video, ext=ext) or video
-
     if not video_pool and combined:
         video_pool = combined
 
     chosen_video = None
     if video_pool:
-        if height:
-            chosen_video = min(video_pool, key=lambda f: abs((f["height"] or 0) - height))
-        else:
-            chosen_video = video_pool[0]
-
+        chosen_video = min(video_pool, key=lambda f: abs((f["height"] or 0) - height)) if height else video_pool[0]
     chosen_audio = audio[0] if audio else (combined[0] if combined else None)
 
     if not chosen_video and not chosen_audio:
@@ -550,6 +798,7 @@ def best(
 
     return {
         "status":  True,
+        "source":  data.get("_source"),
         "videoId": data.get("id"),
         "title":   data.get("title"),
         "audio":   chosen_audio,
@@ -560,17 +809,14 @@ def best(
 @app.get("/subtitles")
 def subtitles(
     url: str = Query(..., description="YouTube video URL"),
-    auto: bool = Query(False, description="True = auto-generated captions, False = uploader ki apni subtitles"),
+    auto: bool = Query(False),
     _auth=Depends(require_api_key),
 ):
-    try:
-        data = _extract(url)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
-
+    data = get_video_data(url)
     subs = _extract_subs(data, auto=auto)
     return {
         "status":         True,
+        "source":         data.get("_source"),
         "videoId":        data.get("id"),
         "auto_generated": auto,
         "languages":      list(subs.keys()),
@@ -581,68 +827,101 @@ def subtitles(
 @app.get("/playlist")
 def playlist(
     url: str = Query(..., description="YouTube playlist URL"),
-    limit: int = Query(50, ge=1, le=200, description="Kitni videos tak fetch karni hain"),
+    limit: int = Query(50, ge=1, le=200),
     _auth=Depends(require_api_key),
 ):
-    """Playlist ke andar ki videos ki halki list (extract_flat — har
-    video ka poora format info nahi laata, isliye fast hai). Har entry
-    ki poori detail chahiye ho to us video ka url /info pe bhejo."""
     try:
-        data = _extract(url, extra_opts={"noplaylist": False, "extract_flat": "in_playlist", "playlistend": limit})
+        opts = _base_ydl_opts()
+        opts.update({"noplaylist": False, "extract_flat": "in_playlist", "playlistend": limit})
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(url, download=False)
+        entries = data.get("entries") or []
+        videos = [
+            {
+                "videoId":   e.get("id"),
+                "title":     e.get("title"),
+                "url":       e.get("url") or (f"https://youtu.be/{e.get('id')}" if e.get("id") else None),
+                "duration":  e.get("duration"),
+                "uploader":  e.get("uploader") or e.get("channel"),
+                "thumbnail": (e.get("thumbnails") or [{}])[-1].get("url"),
+            }
+            for e in entries
+        ]
+        return {"status": True, "source": "yt-dlp", "playlistId": data.get("id"), "playlistTitle": data.get("title"), "video_count": len(videos), "videos": videos}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
+        if not _is_auth_error(e):
+            raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
 
-    entries = data.get("entries") or []
-    videos = [
-        {
-            "videoId":   e.get("id"),
-            "title":     e.get("title"),
-            "url":       e.get("url") or (f"https://youtu.be/{e.get('id')}" if e.get("id") else None),
-            "duration":  e.get("duration"),
-            "uploader":  e.get("uploader") or e.get("channel"),
-            "thumbnail": (e.get("thumbnails") or [{}])[-1].get("url"),
-        }
-        for e in entries
-    ]
+        playlist_id = _playlist_id_from_url(url)
+        if not playlist_id:
+            raise HTTPException(status_code=500, detail="yt-dlp bot-check pe roka aur playlist ID URL se nahi mila, Piped fallback nahi ho saka.")
+        try:
+            pj, _inst = _piped_get(f"/playlists/{playlist_id}")
+        except Exception as pe:
+            raise HTTPException(status_code=502, detail=f"yt-dlp bot-check pe roka aur Piped fallback bhi fail: {pe}")
 
-    return {
-        "status":        True,
-        "playlistId":    data.get("id"),
-        "playlistTitle": data.get("title"),
-        "video_count":   len(videos),
-        "videos":        videos,
-    }
+        entries = (pj.get("relatedStreams") or [])[:limit]
+        videos = [
+            {
+                "videoId":   _video_id_from_url(e.get("url") or ""),
+                "title":     e.get("title"),
+                "url":       f"https://youtu.be{e.get('url')}" if e.get("url") else None,
+                "duration":  e.get("duration"),
+                "uploader":  None,
+                "thumbnail": e.get("thumbnail"),
+            }
+            for e in entries
+        ]
+        return {"status": True, "source": "piped", "playlistId": playlist_id, "playlistTitle": pj.get("name"), "video_count": len(videos), "videos": videos}
 
 
 @app.get("/search")
 def search(
     q: str = Query(..., description="Search query"),
-    limit: int = Query(10, ge=1, le=50, description="Kitne results chahiye"),
+    limit: int = Query(10, ge=1, le=50),
     _auth=Depends(require_api_key),
 ):
-    """YouTube search — ytsearch{n}:query use karta hai. Result halka
-    hai (extract_flat), poori detail ke liye us video ka url /info pe
-    bhej do."""
-    query = f"ytsearch{limit}:{q}"
     try:
-        data = _extract(query, extra_opts={"noplaylist": False, "extract_flat": "in_playlist"})
+        opts = _base_ydl_opts()
+        opts.update({"noplaylist": False, "extract_flat": "in_playlist"})
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
+        entries = data.get("entries") or []
+        results = [
+            {
+                "videoId":   e.get("id"),
+                "title":     e.get("title"),
+                "url":       e.get("url") or (f"https://youtu.be/{e.get('id')}" if e.get("id") else None),
+                "duration":  e.get("duration"),
+                "uploader":  e.get("uploader") or e.get("channel"),
+                "thumbnail": (e.get("thumbnails") or [{}])[-1].get("url"),
+            }
+            for e in entries
+        ]
+        return {"status": True, "source": "yt-dlp", "query": q, "result_count": len(results), "results": results}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yt-dlp search failed: {e}")
+        if not _is_auth_error(e):
+            raise HTTPException(status_code=500, detail=f"yt-dlp search failed: {e}")
 
-    entries = data.get("entries") or []
-    results = [
-        {
-            "videoId":   e.get("id"),
-            "title":     e.get("title"),
-            "url":       e.get("url") or (f"https://youtu.be/{e.get('id')}" if e.get("id") else None),
-            "duration":  e.get("duration"),
-            "uploader":  e.get("uploader") or e.get("channel"),
-            "thumbnail": (e.get("thumbnails") or [{}])[-1].get("url"),
-        }
-        for e in entries
-    ]
+        try:
+            pj, _inst = _piped_get("/search", params={"q": q, "filter": "videos"})
+        except Exception as pe:
+            raise HTTPException(status_code=502, detail=f"yt-dlp bot-check pe roka aur Piped search fallback bhi fail: {pe}")
 
-    return {"status": True, "query": q, "result_count": len(results), "results": results}
+        items = (pj.get("items") if isinstance(pj, dict) else pj) or []
+        results = [
+            {
+                "videoId":   _video_id_from_url(it.get("url") or ""),
+                "title":     it.get("title"),
+                "url":       f"https://youtu.be{it.get('url')}" if it.get("url") else None,
+                "duration":  it.get("duration"),
+                "uploader":  it.get("uploaderName") or it.get("uploader"),
+                "thumbnail": it.get("thumbnail"),
+            }
+            for it in items[:limit]
+            if (it.get("url") or "").startswith("/watch")
+        ]
+        return {"status": True, "source": "piped", "query": q, "result_count": len(results), "results": results}
 
 
 @app.get("/debug")
@@ -650,184 +929,73 @@ def debug(
     url: str = Query(..., description="YouTube video URL"),
     _auth=Depends(require_api_key),
 ):
-    """yt-dlp ka poora verbose log return karta hai, cookie pool ke sath
-    try karte hue. Dekho: 'Retrieved a gvs PO Token', 'JS runtimes: deno',
-    aur agar cookies use hui to unka path bhi dikhega."""
+    """yt-dlp ka poora verbose log + Piped fallback ka status — dono
+    dikhata hai taaki pata chale kaun sa path use hua aur kyun."""
     logger = _LogCapture()
     warm_up_ok = _warm_bgutil_provider()
-    cookie_paths = _cookie_pool_paths()
-    attempts = cookie_paths + [None]
 
-    extracted_ok = False
-    format_count = 0
-    error_msg = None
-    used_cookiefile = None
-    for cookiefile in attempts:
+    ytdlp_ok = False
+    ytdlp_format_count = 0
+    ytdlp_error = None
+    try:
         opts = _base_ydl_opts(logger=logger, verbose=True)
-        if cookiefile:
-            opts["cookiefile"] = cookiefile
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info_data = ydl.extract_info(url, download=False)
-                extracted_ok = True
-                format_count = len(info_data.get("formats", []))
-                used_cookiefile = os.path.basename(cookiefile) if cookiefile else None
-                break
-        except Exception as e:
-            error_msg = str(e)
-            if _is_auth_error(e):
-                continue
-            break
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(url, download=False)
+            ytdlp_ok = True
+            ytdlp_format_count = len(data.get("formats", []))
+    except Exception as e:
+        ytdlp_error = str(e)
+
+    piped_ok = False
+    piped_format_count = 0
+    piped_error = None
+    piped_instance_used = None
+    invidious_ok = False
+    invidious_format_count = 0
+    invidious_error = None
+    invidious_instance_used = None
+
+    if not ytdlp_ok:
+        video_id = _video_id_from_url(url)
+        if video_id:
+            try:
+                pj, instance = _piped_get(f"/streams/{video_id}")
+                piped_ok = True
+                piped_instance_used = instance
+                piped_format_count = len(pj.get("audioStreams", [])) + len(pj.get("videoStreams", []))
+            except Exception as e:
+                piped_error = str(e)
+
+            if not piped_ok:
+                try:
+                    vj, instance = _invidious_get(f"/api/v1/videos/{video_id}")
+                    invidious_ok = True
+                    invidious_instance_used = instance
+                    invidious_format_count = len(vj.get("adaptiveFormats", [])) + len(vj.get("formatStreams", []))
+                except Exception as e:
+                    invidious_error = str(e)
+        else:
+            piped_error = invidious_error = "video ID URL se nahi mila"
 
     return {
         "bgutil_provider_url_configured": bool(BGUTIL_PROVIDER_URL),
         "bgutil_provider_url": BGUTIL_PROVIDER_URL or None,
         "bgutil_warm_up_succeeded": warm_up_ok,
-        "cookie_pool_size": len(cookie_paths),
-        "used_cookiefile": used_cookiefile,
-        "extracted_ok": extracted_ok,
-        "format_count": format_count,
-        "error": error_msg,
+        "ytdlp_extracted_ok": ytdlp_ok,
+        "ytdlp_format_count": ytdlp_format_count,
+        "ytdlp_error": ytdlp_error,
+        "piped_fallback_tried": not ytdlp_ok,
+        "piped_extracted_ok": piped_ok,
+        "piped_instance_used": piped_instance_used,
+        "piped_format_count": piped_format_count,
+        "piped_error": piped_error,
+        "invidious_fallback_tried": not ytdlp_ok and not piped_ok,
+        "invidious_extracted_ok": invidious_ok,
+        "invidious_instance_used": invidious_instance_used,
+        "invidious_format_count": invidious_format_count,
+        "invidious_error": invidious_error,
         "logs": logger.lines,
     }
-
-
-@app.get("/cookies/upload")
-def upload_cookies_form():
-    """Mobile browser se seedha cookies.txt upload karne ka simple page —
-    terminal/curl ki zaroorat nahi. Isi URL ko phone ke browser me kholo.
-    Agar API_KEY set hai to form me wo bhi daalni hogi."""
-    from fastapi.responses import HTMLResponse
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Cookies Upload</title>
-      <style>
-        body { font-family: sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
-        h2 { margin-bottom: 4px; }
-        p { color: #555; }
-        input[type=text], input[type=file] { margin: 10px 0; display: block; width: 100%; box-sizing: border-box; padding: 8px; }
-        button { background: #16a34a; color: white; border: none; padding: 12px 20px;
-                 border-radius: 6px; font-size: 16px; }
-        #result { margin-top: 16px; padding: 12px; border-radius: 6px; display: none; white-space: pre-wrap; word-break: break-all; }
-        #envBox { margin-top: 12px; display: none; }
-        #envBox textarea { width: 100%; box-sizing: border-box; height: 100px; font-size: 12px; padding: 8px; }
-        #copyBtn { background: #2563eb; margin-top: 8px; }
-      </style>
-    </head>
-    <body>
-      <h2>Cookies Upload</h2>
-      <p>Apni exported <b>cookies.txt</b> file yahan choose karke Upload dabao.</p>
-      <input type="text" id="apiKeyInput" placeholder="API key (agar set hai to)">
-      <input type="file" id="fileInput" accept=".txt">
-      <button onclick="upload()">Upload</button>
-      <div id="result"></div>
-      <div id="envBox">
-        <p><b>Permanent save karne ke liye:</b> ye value copy karo, Render → Environment tab me <code>COOKIES_1</code> (ya agla free number) naam se paste karo.</p>
-        <textarea id="envValue" readonly></textarea>
-        <button id="copyBtn" onclick="copyEnv()">Copy value</button>
-      </div>
-      <script>
-        async function upload() {
-          const input = document.getElementById('fileInput');
-          const apikey = document.getElementById('apiKeyInput').value.trim();
-          const resultBox = document.getElementById('result');
-          const envBox = document.getElementById('envBox');
-          if (!input.files.length) { alert('Pehle file choose karo'); return; }
-          const form = new FormData();
-          form.append('file', input.files[0]);
-          resultBox.style.display = 'block';
-          resultBox.style.background = '#eee';
-          resultBox.textContent = 'Uploading...';
-          envBox.style.display = 'none';
-          try {
-            const qs = apikey ? ('?apikey=' + encodeURIComponent(apikey)) : '';
-            const res = await fetch('/cookies/upload' + qs, { method: 'POST', body: form });
-            const data = await res.json();
-            if (res.ok) {
-              resultBox.style.background = '#dcfce7';
-              resultBox.textContent = 'Saved as: ' + data.saved_as + '\\nPool size: ' + data.pool_size;
-              document.getElementById('envValue').value = data.env_var_value;
-              envBox.style.display = 'block';
-            } else {
-              resultBox.style.background = '#fee2e2';
-              resultBox.textContent = 'Failed:\\n' + JSON.stringify(data, null, 2);
-            }
-          } catch (e) {
-            resultBox.style.background = '#fee2e2';
-            resultBox.textContent = 'Error: ' + e;
-          }
-        }
-        function copyEnv() {
-          const box = document.getElementById('envValue');
-          box.select();
-          box.setSelectionRange(0, 99999);
-          navigator.clipboard.writeText(box.value).then(() => alert('Copied!'));
-        }
-      </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
-
-
-@app.post("/cookies/upload")
-async def upload_cookies(file: UploadFile = File(...), _auth=Depends(require_api_key)):
-    """Naya cookies.txt (Netscape format, browser se 'Get cookies.txt
-    LOCALLY' extension se export kiya hua) pool me add karta hai. Isi
-    URL pe file bhej do — turant pool me shaamil ho jaayegi.
-
-    ⚠️ ZAROORI: Ye upload sirf tab tak zinda rehta hai jab tak service
-    redeploy nahi hoti (Render free tier me permanent disk nahi hota,
-    har naye deploy pe wipe ho jaata hai). Isliye response me mila
-    "env_var_value" copy karke Render dashboard → Environment tab me
-    COOKIES_1 (ya COOKIES_2, COOKIES_3...) naam se env var banao —
-    wo hamesha ke liye survive karega, chahe kitni bhi baar redeploy ho.
-
-    curl -F "file=@cookies.txt" https://<your-api>/cookies/upload
-    Ya phir browser se GET /cookies/upload wala form use karo.
-    """
-    contents = await file.read()
-    if not contents or b"\t" not in contents:
-        raise HTTPException(status_code=400, detail="Ye valid Netscape cookies.txt nahi lagti — format check karo")
-
-    existing = len(_cookie_pool_paths())
-    path = os.path.join(COOKIE_DIR, f"upload_{existing + 1}_{int(time.time())}.txt")
-    with open(path, "wb") as f:
-        f.write(contents)
-
-    return {
-        "status": True,
-        "saved_as": os.path.basename(path),
-        "pool_size": len(_cookie_pool_paths()),
-        "note": "Ye upload agle redeploy pe udd jaayega. Neeche wali env_var_value copy karke Render → Environment tab me COOKIES_1 (ya agla free number) naam se save karo — tabhi permanent rahega.",
-        "env_var_value": base64.b64encode(contents).decode("ascii"),
-    }
-
-
-@app.get("/cookies/status")
-def cookies_status(_auth=Depends(require_api_key)):
-    """Pool ke har cookie-set ko ek chhote test-video pe try karta hai
-    aur bata deta hai kaun zinda hai, kaun expire ho chuka. Regularly
-    check karte raho — jab sab 'valid: false' ho jaayein, tabhi nayi
-    cookies daalni hain."""
-    results = []
-    for path in _cookie_pool_paths():
-        opts = _base_ydl_opts()
-        opts["cookiefile"] = path
-        valid = True
-        err = None
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info("https://youtu.be/dQw4w9WgXcQ", download=False)
-        except Exception as e:
-            valid = not _is_auth_error(e)  # non-auth error = video-specific issue, cookie khud theek ho sakti hai
-            err = str(e)[:200] if not valid else None
-        results.append({"file": os.path.basename(path), "valid": valid, "error": err})
-
-    return {"pool_size": len(results), "cookies": results}
 
 
 @app.get("/health")
