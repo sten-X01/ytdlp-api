@@ -32,6 +32,8 @@ Render pe deploy:
     Start Command : uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -132,6 +134,41 @@ def _warm_bgutil_provider(retries: int = 2, delay_seconds: int = 4) -> bool:
 #   to hardcoded fallback list use hoti hai.
 # ══════════════════════════════════════════════════════════════════════
 
+def _race_get(bases: list[str], path: str, params: dict | None = None, timeout: int = 10, max_workers: int = 15):
+    """Kai instances ko EK SAATH (parallel) hit karta hai, jo bhi pehle
+    valid jawab de use turant le leta hai. Pehle serial try hota tha —
+    dead/slow instances ke saath 10-15 instances ko baari-baari try
+    karne me hi 60-100+ second lag jaate the, jisme beech ke kayi
+    genuinely fine instances bhi timeout ki wajah se miss ho jaate the.
+    Parallel karne se poori race sirf ek timeout jitni der (~10s) me
+    khatam ho jaati hai, chahe kitni bhi instances try karo."""
+    bases = list(bases)
+    random.shuffle(bases)  # hamesha wahi pehli 2-3 instances overload na ho
+    errors = []
+
+    def try_one(base: str):
+        try:
+            r = requests.get(base.rstrip("/") + path, params=params, timeout=timeout)
+            if r.status_code != 200:
+                return None, f"{base} -> HTTP {r.status_code}"
+            data = r.json()
+            if isinstance(data, dict) and data.get("error"):
+                return None, f"{base} -> {data.get('message') or data.get('error')}"
+            return (data, base), None
+        except Exception as e:
+            return None, f"{base} -> {type(e).__name__}: {e}"
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(bases))) as ex:
+        futures = {ex.submit(try_one, b): b for b in bases}
+        for fut in as_completed(futures):
+            result, err = fut.result()
+            if result:
+                return result
+            errors.append(err)
+
+    raise RuntimeError("Sabhi instances fail ho gaye:\n" + "\n".join(errors))
+
+
 FALLBACK_PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.leptons.xyz",
@@ -188,29 +225,13 @@ def _get_piped_instances() -> list[str]:
     return instances
 
 
-def _piped_get(path: str, params: dict | None = None, max_tries: int = 10):
-    """Path ko baari-baari kai Piped instances pe try karta hai jab tak
-    ek jawab na de. Har instance apne aap me poori tarah independent
-    server hai, isliye ek down/slow/DNS-fail ho to doosri try ho jaati
-    hai. Timeout jaan-boojh kar chhota (8s) rakha hai taaki dead
-    instances pe zyada time waste na ho — 10 instances tak try karne
-    par bhi worst case ~80s hi lagega."""
-    last_err = None
-    for base in _get_piped_instances()[:max_tries]:
-        try:
-            r = requests.get(base.rstrip("/") + path, params=params, timeout=8)
-            if r.status_code != 200:
-                last_err = f"{base} -> HTTP {r.status_code}"
-                continue
-            data = r.json()
-            if isinstance(data, dict) and data.get("error"):
-                last_err = f"{base} -> {data.get('message') or data.get('error')}"
-                continue
-            return data, base
-        except Exception as e:
-            last_err = f"{base} -> {e}"
-            continue
-    raise RuntimeError(f"Sabhi Piped instances fail ho gaye. Last error: {last_err}")
+def _piped_get(path: str, params: dict | None = None, max_tries: int = 15):
+    """Sabhi (ya top max_tries) Piped instances ko parallel race karta
+    hai — jo pehle jawab de wahi use ho jaata hai."""
+    try:
+        return _race_get(_get_piped_instances()[:max_tries], path, params=params)
+    except RuntimeError as e:
+        raise RuntimeError(f"Piped: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -261,22 +282,12 @@ def _get_invidious_instances() -> list[str]:
 
 
 def _invidious_get(path: str, params: dict | None = None, max_tries: int = 8):
-    last_err = None
-    for base in _get_invidious_instances()[:max_tries]:
-        try:
-            r = requests.get(base.rstrip("/") + path, params=params, timeout=8)
-            if r.status_code != 200:
-                last_err = f"{base} -> HTTP {r.status_code}"
-                continue
-            data = r.json()
-            if isinstance(data, dict) and data.get("error"):
-                last_err = f"{base} -> {data.get('error')}"
-                continue
-            return data, base
-        except Exception as e:
-            last_err = f"{base} -> {e}"
-            continue
-    raise RuntimeError(f"Sabhi Invidious instances fail ho gaye. Last error: {last_err}")
+    """Sabhi (ya top max_tries) Invidious instances ko parallel race
+    karta hai."""
+    try:
+        return _race_get(_get_invidious_instances()[:max_tries], path, params=params)
+    except RuntimeError as e:
+        raise RuntimeError(f"Invidious: {e}")
 
 
 YOUTUBE_ID_RE = re.compile(r"(?:v=|/videos/|embed/|youtu\.be/|shorts/|live/)([0-9A-Za-z_-]{11})")
