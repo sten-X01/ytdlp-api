@@ -3,6 +3,20 @@ services:
     name: ytinfo-api
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt && curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip && unzip -o /tmp/deno.zip -d /opt/render/project/src/.venv/bin && chmod +x /opt/render/project/src/.venv/bin/deno
+    # 1. Python deps install
+    # 2. Deno (JS runtime) download — chahiye PO-token generation ke liye
+    # 3. bgutil-ytdlp-pot-provider repo clone (1.3.1 = requirements.txt me pinned version se match)
+    # 4. uske server/ folder ke andar Deno se dependencies install (canvas waghera)
+    # Isse "script mode" PO-token provider bina kisi alag se chalti hui service
+    # ke, bina cookies ke, khud yt-dlp ke andar hi kaam karta hai.
+    buildCommand: >
+      pip install -r requirements.txt &&
+      curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip &&
+      unzip -o /tmp/deno.zip -d /opt/render/project/src/.venv/bin &&
+      chmod +x /opt/render/project/src/.venv/bin/deno &&
+      git clone --single-branch --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git bgutil-ytdlp-pot-provider &&
+      cd bgutil-ytdlp-pot-provider/server &&
+      /opt/render/project/src/.venv/bin/deno install --allow-scripts=npm:canvas --frozen
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
+
