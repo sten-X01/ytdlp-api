@@ -90,7 +90,7 @@ BGUTIL_PROVIDER_URL = os.environ.get("BGUTIL_PROVIDER_URL", "").strip()
 BGUTIL_SCRIPT_HOME = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "bgutil-ytdlp-pot-provider", "server"
 )
-BGUTIL_SCRIPT_AVAILABLE = os.path.isdir(BGUTIL_SCRIPT_HOME)
+BGUTIL_SCRIPT_AVAILABLE = os.path.isdir(BGUTIL_SCRIPT_HOME) and os.environ.get("SKIP_BGUTIL_SCRIPT", "").strip().lower() not in ("1", "true", "yes")
 
 AUTH_ERROR_MARKERS = (
     "sign in to confirm",
@@ -502,23 +502,25 @@ def get_video_data(url: str) -> dict:
       1. yt-dlp (cookies ke bina — android/ios/tv/mweb/web clients)
       2. Piped network (dozens of free public instances)
       3. Invidious network (alag codebase/community, dusra safety net)
-    Teeno fail ho to hi error uthaata hai — matlab poori request tabhi
-    fail hogi jab dono independent proxy-networks EK SAATH down hon,
-    jo ki rare hai."""
+    yt-dlp KISI BHI wajah se fail ho (bot-check, timeout, network error,
+    slow PO-token script waghera) — fallback chain turant try hoti hai.
+    Pehle sirf "bot-check" wale errors pe hi fallback trigger hota tha,
+    jisse Deno-timeout jaisी doosri wajah se fail hone par seedha error
+    mil jaata tha, Piped/Invidious try hue bina. Ab teeno fail ho to hi
+    error uthaata hai."""
     _warm_bgutil_provider()
+    ytdlp_err = None
     try:
         with yt_dlp.YoutubeDL(_base_ydl_opts()) as ydl:
             data = ydl.extract_info(url, download=False)
         data["_source"] = "yt-dlp"
         return data
     except Exception as e:
-        if not _is_auth_error(e):
-            raise HTTPException(status_code=500, detail=f"yt-dlp extract failed: {e}")
         ytdlp_err = e
 
     video_id = _video_id_from_url(url)
     if not video_id:
-        raise HTTPException(status_code=500, detail=f"yt-dlp ne bot-check pe roka ({ytdlp_err}) aur URL se video ID bhi nahi nikal paya, fallback nahi ho saka.")
+        raise HTTPException(status_code=500, detail=f"yt-dlp extract failed ({ytdlp_err}) aur URL se video ID bhi nahi nikal paya, fallback nahi ho saka.")
 
     piped_err = None
     try:
@@ -533,7 +535,7 @@ def get_video_data(url: str) -> dict:
     except Exception as ie:
         raise HTTPException(
             status_code=502,
-            detail=f"yt-dlp bot-check pe roka, aur Piped ({piped_err}) + Invidious ({ie}) dono fallback fail ho gaye.",
+            detail=f"yt-dlp fail ({ytdlp_err}), aur Piped ({piped_err}) + Invidious ({ie}) dono fallback fail ho gaye.",
         )
 
 
