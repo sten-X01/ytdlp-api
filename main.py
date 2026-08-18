@@ -157,7 +157,7 @@ def _warm_bgutil_provider(retries: int = 2, delay_seconds: int = 4) -> bool:
 #   to hardcoded fallback list use hoti hai.
 # ══════════════════════════════════════════════════════════════════════
 
-def _race_get(bases: list[str], path: str, params: dict | None = None, timeout: int = 10, max_workers: int = 15):
+def _race_get(bases: list[str], path: str, params: dict | None = None, timeout: int = 7, max_workers: int = 15):
     """Kai instances ko EK SAATH (parallel) hit karta hai, jo bhi pehle
     valid jawab de use turant le leta hai. Pehle serial try hota tha —
     dead/slow instances ke saath 10-15 instances ko baari-baari try
@@ -305,6 +305,45 @@ def _invidious_get(path: str, params: dict | None = None, max_tries: int = 8):
         return _race_get(_get_invidious_instances()[:max_tries], path, params=params)
     except RuntimeError as e:
         raise RuntimeError(f"Invidious: {e}")
+
+
+def _race_video_fallback(video_id: str, timeout: int = 7) -> dict:
+    """Piped + Invidious — DONO networks ki SAARI instances ko EK HI
+    parallel race me daalta hai (sequential nahi, jaisa pehle tha).
+    Pehle Piped ki 15 instances poori try hoti thi, TAB jaake Invidious
+    ki 8 try hoti thi — is se total time (khaas taur pe tricky videos
+    pe, jaha zyada instances fail hoti hain) Koyeb ke gateway timeout se
+    zyada ho jaata tha aur 502 mil jaata tha. Ab dono networks ki sabhi
+    ~23 instances ek saath fire hoti hain, jo bhi PEHLE (chahe Piped ho
+    ya Invidious) jawab de wahi use hota hai — poora fallback ab sirf
+    ek timeout (~7s) jitna hi lagega."""
+    tasks = [("piped", b) for b in _get_piped_instances()] + [("invidious", b) for b in _get_invidious_instances()]
+    random.shuffle(tasks)
+    errors = []
+
+    def try_one(kind: str, base: str):
+        path = f"/streams/{video_id}" if kind == "piped" else f"/api/v1/videos/{video_id}"
+        try:
+            r = requests.get(base.rstrip("/") + path, timeout=timeout)
+            if r.status_code != 200:
+                return None, f"{kind}:{base} -> HTTP {r.status_code}"
+            data = r.json()
+            if isinstance(data, dict) and data.get("error"):
+                return None, f"{kind}:{base} -> {data.get('message') or data.get('error')}"
+            return (kind, data), None
+        except Exception as e:
+            return None, f"{kind}:{base} -> {type(e).__name__}: {e}"
+
+    with ThreadPoolExecutor(max_workers=min(24, len(tasks))) as ex:
+        futures = {ex.submit(try_one, k, b): (k, b) for k, b in tasks}
+        for fut in as_completed(futures):
+            result, err = fut.result()
+            if result:
+                kind, data = result
+                return _piped_normalize(data, video_id) if kind == "piped" else _invidious_normalize(data, video_id)
+            errors.append(err)
+
+    raise RuntimeError("Sabhi Piped + Invidious instances fail ho gaye:\n" + "\n".join(errors))
 
 
 YOUTUBE_ID_RE = re.compile(r"(?:v=|/videos/|embed/|youtu\.be/|shorts/|live/)([0-9A-Za-z_-]{11})")
@@ -522,20 +561,12 @@ def get_video_data(url: str) -> dict:
     if not video_id:
         raise HTTPException(status_code=500, detail=f"yt-dlp extract failed ({ytdlp_err}) aur URL se video ID bhi nahi nikal paya, fallback nahi ho saka.")
 
-    piped_err = None
     try:
-        pj, _inst = _piped_get(f"/streams/{video_id}")
-        return _piped_normalize(pj, video_id)
-    except Exception as pe:
-        piped_err = pe
-
-    try:
-        vj, _inst = _invidious_get(f"/api/v1/videos/{video_id}")
-        return _invidious_normalize(vj, video_id)
-    except Exception as ie:
+        return _race_video_fallback(video_id)
+    except Exception as fe:
         raise HTTPException(
             status_code=502,
-            detail=f"yt-dlp fail ({ytdlp_err}), aur Piped ({piped_err}) + Invidious ({ie}) dono fallback fail ho gaye.",
+            detail=f"yt-dlp fail ({ytdlp_err}), aur Piped+Invidious fallback bhi fail ho gaya: {fe}",
         )
 
 
